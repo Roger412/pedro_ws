@@ -1460,3 +1460,223 @@ P1 hardware/safety:
     cannot leave the last PWM duty applied.
 11. Decide whether ESTOP should remain reset-only or gain a deliberate
     clear command.
+
+---
+
+## 21. Final documentation review (session 6)
+
+Date: 2026-05-14.
+
+This section closes the documentation pass requested by
+`session6_final_docs.md`. Earlier sections remain as history; the tables
+below are the final references for bench testing.
+
+### 21.1 Final mecanum wheel mapping
+
+The firmware preserves OMNIBASE's kinematic sign convention exactly:
+
+```
+g_wheel_sign[4] = { -1.0, +1.0, -1.0, +1.0 };
+```
+
+`computeNecessaryWheelSpeedsMecanum()` uses the OMNIBASE IK signs:
+
+| Body command | Pre-sign IK output `u[0..3]` | Motor-frame command after `wheel_sign` |
+|---|---|---|
+| `+x` forward | `(+,+,+,+)` | `(-,+,-,+)` |
+| `+y` left/sideways | `(-,+,+,-)` | `(+,+,-,-)` |
+| `+yaw` CCW | `(-,+,-,+)` | `(+,+,+,+)` |
+
+Final per-index electrical mapping:
+
+| Index | Physical position | PWM / enable | H-bridge direction pins | Encoder timer / pins | Command sign | Encoder sign in odom |
+|---|---|---|---|---|---|---|
+| M0 / `u[0]` | TODO: confirm FL/FR/RL/RR on hardware | PA0 / TIM5_CH1 | PD4=A, PD5=B | TIM1: PE9/PE11 | `-1` | measured `omega[0]` multiplied by `-1` before FK |
+| M1 / `u[1]` | TODO: confirm FL/FR/RL/RR on hardware | PB14 / TIM12_CH1 | PD6=A, PD7=B | TIM2: PA15/PB3 | `+1` | measured `omega[1]` multiplied by `+1` before FK |
+| M2 / `u[2]` | TODO: confirm FL/FR/RL/RR on hardware | PF9 / TIM14_CH1 | PE2=A, PE4=B | TIM4: PD12/PD13 | `-1` | measured `omega[2]` multiplied by `-1` before FK |
+| M3 / `u[3]` | TODO: confirm FL/FR/RL/RR on hardware | PE5 / TIM15_CH1 | PE3=A, PE6=B | TIM8: PC6/PC7 | `+1` | measured `omega[3]` multiplied by `+1` before FK |
+
+Direction code from `setMotorDirection()`:
+
+| Direction code | Pin A | Pin B | Meaning in firmware |
+|---|---|---|---|
+| `0` | LOW | HIGH | positive signed PWM path |
+| `1` | HIGH | LOW | negative signed PWM path |
+| `2` or larger | LOW | LOW | brake/off |
+
+The exact physical wheel names are still intentionally marked TODO: neither
+PEDRO nor OMNIBASE source labels the indices as front-left/front-right/rear-left
+or rear-right. Before powered ground testing, lift the robot and verify that
+the three command patterns above produce the expected robot-frame motion.
+
+### 21.2 LED / protoboard desk-test procedure
+
+`DEBUG_LEDS` is a compile-time test switch in `CM7/Core/Inc/main.h`.
+Default is `0` for production. Set it to `1` only for a no-motor bench
+test, rebuild, and flash.
+
+With `DEBUG_LEDS=1`, the firmware:
+
+- holds all real H-bridge direction pins in brake: PD4/PD5, PD6/PD7,
+  PE2/PE4, PE3/PE6 are driven LOW/LOW;
+- writes zero compare to TIM5, TIM12, TIM14, and TIM15, so no PWM is
+  intentionally driven to the L298N enable pins;
+- lights Nucleo LD1 (PB0) when M0 or M2 is commanded above threshold;
+- lights Nucleo LD2 (PE1) when M1 or M3 is commanded above threshold;
+- skips LD3 because PB14 is the real M1 PWM pin.
+
+Connection for a protoboard LED test:
+
+| Signal | MCU pin | Test connection | Expected behavior |
+|---|---|---|---|
+| LD1 mirror | PB0 | LED anode through 330-1k resistor to PB0, cathode to GND | ON when M0 or M2 command magnitude exceeds the debug threshold |
+| LD2 mirror | PE1 | LED anode through 330-1k resistor to PE1, cathode to GND | ON when M1 or M3 command magnitude exceeds the debug threshold |
+| Optional DIR checks | PD4/PD5, PD6/PD7, PE2/PE4, PE3/PE6 | LED/resistor or logic probe to each pin | In `DEBUG_LEDS=1`, all stay LOW because the H-bridge outputs are held in brake |
+
+Command expectations in debug mode:
+
+| Test command source | Expected LEDs | Notes |
+|---|---|---|
+| `/cmd_vel` `linear.x > 0` | LD1 and LD2 ON | all four wheels receive a nonzero command |
+| `/cmd_vel` `linear.y > 0` | LD1 and LD2 ON | all four wheels receive a nonzero command with a different sign pattern |
+| `/cmd_vel` `angular.z > 0` | LD1 and LD2 ON | all four wheels receive a nonzero command |
+| zero command or watchdog STOP | LD1 and LD2 OFF | PWM duties are zeroed |
+
+For actual per-wheel direction verification, use motor power with the robot
+lifted, `DEBUG_LEDS=0`, and inspect the direction pins/PWM outputs from the
+mapping table in §21.1.
+
+### 21.3 ROS 2 test procedure
+
+Build and source the workspace:
+
+```bash
+cd /home/roger/Github/pedro_ws/omnibase_ws
+colcon build --packages-select serial_comm --symlink-install
+source install/setup.bash
+```
+
+Run the serial bridge:
+
+```bash
+ros2 run serial_comm serial_communication --ros-args \
+  -p serial_port:=/dev/ttyACM0 \
+  -p baud:=115200
+```
+
+Useful telemetry checks:
+
+```bash
+ros2 topic echo /stm32/raw
+ros2 topic echo /stm32/robot_state
+ros2 topic echo /stm32/omegas
+ros2 topic echo /stm32/pwm
+ros2 topic echo /odom
+ros2 topic echo /imu/data
+```
+
+Send a low-speed test command:
+
+```bash
+ros2 topic pub --once /cmd_vel geometry_msgs/msg/Twist \
+  "{linear: {x: 0.05, y: 0.0, z: 0.0}, angular: {x: 0.0, y: 0.0, z: 0.0}}"
+```
+
+Then test sideways and yaw:
+
+```bash
+ros2 topic pub --once /cmd_vel geometry_msgs/msg/Twist \
+  "{linear: {x: 0.0, y: 0.05, z: 0.0}, angular: {x: 0.0, y: 0.0, z: 0.0}}"
+
+ros2 topic pub --once /cmd_vel geometry_msgs/msg/Twist \
+  "{linear: {x: 0.0, y: 0.0, z: 0.0}, angular: {x: 0.0, y: 0.0, z: 0.2}}"
+```
+
+The host bridge stops echoing stale `/cmd_vel` after 0.5 s, and the firmware
+also drops RUNNING to STOP if no valid UART command is parsed for 500 ms.
+
+Optional dashboard:
+
+```bash
+ros2 run serial_comm pedro_dashboard
+```
+
+Open `http://localhost:5000`.
+
+### 21.4 Final UART formats
+
+Host to STM32 remains the original PEDRO 30-number frame, whitespace-separated
+and terminated by `\r\n` or `\n`:
+
+```
+x_desired y_desired phi_end d r
+u1_desired u2_desired u3_desired u4_desired
+x_Kp x_Ki x_Kd
+y_Kp y_Ki y_Kd
+phi_Kp phi_Ki phi_Kd
+u0_Kp u0_Ki u0_Kd
+u1_Kp u1_Ki u1_Kd
+u2_Kp u2_Ki u2_Kd
+u3_Kp u3_Ki u3_Kd
+```
+
+Example all-zero hold command with default geometry and gains:
+
+```
+0.0 0.0 0.0 0.195 0.0762 0.0 0.0 0.0 0.0 0.5 0.1 0.0 0.5 0.1 0.0 0.5 0.1 0.0 30.5 0.5 1.01 30.5 0.5 1.01 30.5 0.5 1.01 30.5 0.5 1.01
+```
+
+Example twist command for slow forward motion. Because all four `u*_desired`
+slots are zero and `x_desired` is nonzero, firmware twist mode computes the
+mecanum wheel speeds:
+
+```
+0.05 0.0 0.0 0.195 0.0762 0.0 0.0 0.0 0.0 0.5 0.1 0.0 0.5 0.1 0.0 0.5 0.1 0.0 30.5 0.5 1.01 30.5 0.5 1.01 30.5 0.5 1.01 30.5 0.5 1.01
+```
+
+Example ESTOP sentinel:
+
+```
+-9999.0 0.0 0.0 0.195 0.0762 0.0 0.0 0.0 0.0 0.5 0.1 0.0 0.5 0.1 0.0 0.5 0.1 0.0 30.5 0.5 1.01 30.5 0.5 1.01 30.5 0.5 1.01 30.5 0.5 1.01
+```
+
+STM32 to host is one comma-separated `key=value` line at roughly 100 Hz.
+Representative frame:
+
+```
+x_desired=0.050000,y_desired=0.000000,phi_desired=0.000000,d=0.195000,r=0.076200,roll=0.000000,pitch=0.000000,yaw=0.000000,IMU_qx=0.000000,IMU_qy=0.000000,IMU_qz=0.000000,IMU_qw=1.000000,IMU_wx=0.000000,IMU_wy=0.000000,IMU_wz=0.000000,IMU_ax=0.000000,IMU_ay=0.000000,IMU_az=0.000000,TIM1=0,TIM2=0,TIM4=0,TIM8=0,Enc_Wheel_Omega1=0.000000,Enc_Wheel_Omega2=0.000000,Enc_Wheel_Omega3=0.000000,Enc_Wheel_Omega4=0.000000,Inertial_ang_vel_calc=0.000000,Inertial_x_vel_calc=0.000000,Inertial_y_vel_calc=0.000000,ODOM_phi=0.000000,ODOM_x_pos=0.000000,ODOM_y_pos=0.000000,ODOM_Err_x=0.000000,ODOM_Err_y=0.000000,ODOM_Err_phi=0.000000,U_Err_1=0.000000,U_Err_2=0.000000,U_Err_3=0.000000,U_Err_4=0.000000,Ctrl_Inertial_x_dot=0.050000,Ctrl_Inertial_y_dot=0.000000,Ctrl_Inertial_phi_dot=0.000000,Ctrl_necc_u1=0.656168,Ctrl_necc_u2=0.656168,Ctrl_necc_u3=0.656168,Ctrl_necc_u4=0.656168,ts_current=1000,ts_previous=990,ts_delta=10,Ctrl_duty_u1=0,Ctrl_duty_u2=0,Ctrl_duty_u3=0,Ctrl_duty_u4=0,robot_state=1,xKp=0.500000,xKi=0.100000,xKd=0.000000,yKp=0.500000,yKi=0.100000,yKd=0.000000,phiKp=0.500000,phiKi=0.100000,phiKd=0.000000,u0Kp=30.500000,u0Ki=0.500000,u0Kd=1.010000,u1Kp=30.500000,u1Ki=0.500000,u1Kd=1.010000,u2Kp=30.500000,u2Ki=0.500000,u2Kd=1.010000,u3Kp=30.500000,u3Ki=0.500000,u3Kd=1.010000
+```
+
+### 21.5 Complete modified / added file list
+
+Firmware target:
+
+- `firmware/STM32H7_PEDRO_OMNIBASE/CM7/Core/Inc/main.h`
+- `firmware/STM32H7_PEDRO_OMNIBASE/CM7/Core/Src/main.c`
+- `firmware/STM32H7_PEDRO_OMNIBASE/CM7/.cproject`
+- `firmware/STM32H7_PEDRO_OMNIBASE/CM7/Core/Inc/sh2_hal_impl.h`
+- `firmware/STM32H7_PEDRO_OMNIBASE/CM7/Core/Src/sh2_hal_impl.c`
+- `firmware/STM32H7_PEDRO_OMNIBASE/CM7/Core/Inc/sh2/euler.h`
+- `firmware/STM32H7_PEDRO_OMNIBASE/CM7/Core/Inc/sh2/sh2.h`
+- `firmware/STM32H7_PEDRO_OMNIBASE/CM7/Core/Inc/sh2/sh2_err.h`
+- `firmware/STM32H7_PEDRO_OMNIBASE/CM7/Core/Inc/sh2/sh2_hal.h`
+- `firmware/STM32H7_PEDRO_OMNIBASE/CM7/Core/Inc/sh2/sh2_SensorValue.h`
+- `firmware/STM32H7_PEDRO_OMNIBASE/CM7/Core/Inc/sh2/sh2_util.h`
+- `firmware/STM32H7_PEDRO_OMNIBASE/CM7/Core/Inc/sh2/shtp.h`
+- `firmware/STM32H7_PEDRO_OMNIBASE/CM7/Core/Src/sh2/euler.c`
+- `firmware/STM32H7_PEDRO_OMNIBASE/CM7/Core/Src/sh2/sh2.c`
+- `firmware/STM32H7_PEDRO_OMNIBASE/CM7/Core/Src/sh2/sh2_SensorValue.c`
+- `firmware/STM32H7_PEDRO_OMNIBASE/CM7/Core/Src/sh2/sh2_util.c`
+- `firmware/STM32H7_PEDRO_OMNIBASE/CM7/Core/Src/sh2/shtp.c`
+- `firmware/STM32H7_PEDRO_OMNIBASE/status.md`
+- `firmware/STM32H7_PEDRO_OMNIBASE/status.txt`
+
+ROS 2 host package:
+
+- `omnibase_ws/src/serial_comm/serial_comm/serial_communication.py`
+- `omnibase_ws/src/serial_comm/serial_comm/pedro_dashboard.py`
+- `omnibase_ws/src/serial_comm/serial_comm/dashboard.html`
+- `omnibase_ws/src/serial_comm/setup.py`
+- `omnibase_ws/src/serial_comm/package.xml`
+
+No original files under `firmware/STM32H7_PEDRO/` were modified.
