@@ -1009,3 +1009,133 @@ check ran. Manual review focus:
 - Queue reads in `StartControlTask` and `Start_UART_TX_Task` are
   non-blocking (timeout = 0), so a stalled producer no longer deadlocks
   consumers (the old `osWaitForever` reads were a latent bug).
+
+---
+
+## 18. ROS 2 — `serial_comm` host node update (session 3)
+
+### 18.1 Files changed
+
+- `omnibase_ws/src/serial_comm/serial_comm/serial_communication.py` —
+  rewritten to consume the session-2 telemetry/command format (the
+  PEDRO 30-float command and the extended telemetry with `IMU_q*`,
+  `IMU_w*`, `IMU_a*`, `robot_state`).
+- `omnibase_ws/src/serial_comm/package.xml` — declared the previously
+  implicit run-deps (`rclpy`, `std_msgs`, `geometry_msgs`,
+  `sensor_msgs`, `nav_msgs`, `python3-serial`).
+- `omnibase_ws/src/serial_comm/serial_comm/simple_rx.py` — unchanged.
+
+### 18.2 Behaviour changes vs. previous `serial_comm`
+
+| Area | Before | After |
+|---|---|---|
+| TX payload | Always parameter-driven: pose + per-wheel u + 21 PID gains. | Same 30-float layout, but `/cmd_vel` (`geometry_msgs/Twist`) now takes priority when active. Setting `use_cmd_vel=false` restores the parameter-only behaviour. |
+| TX cadence | Hardcoded 10 Hz. | Parameter `tx_rate_hz` (default 10 Hz). |
+| TX rounding | `round(v, 2)` then `' '.join(map(str, ...))` — could collapse a tiny twist to zero. | `round(v, 4)` and an explicit format that keeps small values; whole-number values still emitted as `1.0` so the firmware `sscanf("%lf %lf ... %f %f")` accepts them. |
+| Serial config | `/dev/ttyACM0` 115200 hardcoded. | Parameters `serial_port`, `baud` (defaults unchanged). |
+| RX regex | `(\w+)=([-+]?\d*\.\d+|\d+)` — silently dropped scientific notation. | `(\w+)=([-+]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][-+]?\d+)?)` — accepts `1e-3` too. |
+| `/cmd_vel` watchdog | n/a | If no `/cmd_vel` for `cmd_vel_timeout` (default 0.5 s), the bridge stops echoing the last twist. The firmware still has its own 500 ms watchdog (§12, §FINAL UART COMMAND FORMAT). |
+| ESTOP | n/a | `send_estop()` helper writes `x_desired = -9999.0` (= `ESTOP_CMD_KEY`). Not wired to a topic yet; exposed for future service/action. |
+| Serial close on shutdown | Port left open. | `node.ser.close()` in `main()` finally-block. |
+
+### 18.3 Topic inventory (after session 3)
+
+Subscribers:
+
+| Topic | Type | Notes |
+|---|---|---|
+| `cmd_vel` | `geometry_msgs/Twist` | Linear x/y → body-frame `vx`, `vy`; angular z → `wz`. Disabled when parameter `use_cmd_vel=false`. |
+
+Publishers — **legacy (kept verbatim for back-compat)**:
+
+| Topic | Type |
+|---|---|
+| `stm32/raw` | `std_msgs/String` |
+| `stm32_debug` | `std_msgs/String` (multi-line human summary, now includes `IMU_q*`, `IMU_w*`, `IMU_a*`, `robot_state`) |
+| `stm32/pose` | `Float32MultiArray` `[x, y, phi, d, r]` |
+| `stm32/imu` | `Float32MultiArray` `[roll, pitch, yaw]` |
+| `stm32/omegas` | `Float32MultiArray` `[ω1..ω4]` (rev/s, signed) |
+| `stm32/real_speeds` | `Float32MultiArray` `[φ_dot, x_dot, y_dot]` (world frame) |
+| `stm32/odom` | `Float32MultiArray` `[phi, x, y]` |
+| `stm32/errors` | `Float32MultiArray` `[dx, dy, dphi]` |
+| `stm32/u_errors` | `Float32MultiArray` per-wheel ω errors |
+| `stm32/ctrl_speeds` | `Float32MultiArray` `[x_dot, y_dot, phi_dot]` |
+| `stm32/ctrl_u` | `Float32MultiArray` `[u1..u4]` |
+| `stm32/pwm` | `Int32MultiArray` `[duty1..duty4]` |
+| `stm32/timing` | `Int32MultiArray` `[ts_current, ts_previous, ts_delta]` |
+| `stm32/encoders` | `Int32MultiArray` `[TIM1, TIM2, TIM4, TIM8]` |
+| `stm32/pid_gains/{x,y,phi,u0..u3}` | `Float32MultiArray` `[Kp, Ki, Kd]` |
+
+Publishers — **new (standard messages)**:
+
+| Topic | Type | Frame / contents |
+|---|---|---|
+| `imu/data` | `sensor_msgs/Imu` | `imu_link` (parameter `imu_frame`). Orientation = `IMU_qx,qy,qz,qw`. Angular vel = `IMU_w*` (rad/s, body). Linear accel = `IMU_a*` (m/s², gravity removed). Covariance unknown (`[0] = -1` per REP). |
+| `odom` | `nav_msgs/Odometry` | header `odom_frame` (default `odom`), child `base_frame` (default `base_link`). Pose = `ODOM_{x_pos,y_pos,phi}`. Twist rotated from world to body using `ODOM_phi`. |
+| `stm32/cmd_setpoint` | `geometry_msgs/TwistStamped` | Echo of `x_desired, y_desired, phi_desired` (body-frame) for plotting. |
+| `stm32/robot_state` | `std_msgs/Int32` | 0=IDLE, 1=RUNNING, 2=STOP, 3=ESTOP. |
+| `stm32/robot_state_name` | `std_msgs/String` | Human-readable mirror of `robot_state`. |
+| `stm32/encoder/wheel{0..3}` | `std_msgs/Int32` | Per-wheel encoder counters (TIM1/TIM2/TIM4/TIM8). |
+| `stm32/omega/wheel{0..3}` | `std_msgs/Float32` | Per-wheel `Enc_Wheel_Omega{1..4}`. |
+| `stm32/pwm/wheel{0..3}` | `std_msgs/Int32` | Per-wheel `Ctrl_duty_u{1..4}`. |
+
+### 18.4 Parameters
+
+| Name | Default | Effect |
+|---|---|---|
+| `serial_port` | `/dev/ttyACM0` | pyserial device. |
+| `baud` | `115200` | Must match USART3 (§4.1, §FINAL UART COMMAND FORMAT). |
+| `tx_rate_hz` | `10.0` | TX cadence; the firmware watchdog is 500 ms so anything ≥ 2 Hz is safe. |
+| `odom_frame` | `odom` | `Odometry.header.frame_id`. |
+| `base_frame` | `base_link` | `Odometry.child_frame_id` and `TwistStamped.header.frame_id`. |
+| `imu_frame` | `imu_link` | `Imu.header.frame_id`. |
+| `use_cmd_vel` | `true` | If false, the node ignores `/cmd_vel` and only sends parameter-driven setpoints. |
+| `cmd_vel_timeout` | `0.5` (s) | Host-side fresh-command window. Independent of the firmware's 500 ms watchdog (`CMD_WATCHDOG_TIMEOUT_MS`). |
+| Pose setpoints | `x=0, y=0, phi=0, d=0.195, r=0.0762` | `d` is overloaded as `x_off` in the merged firmware; `r` is wheel radius. |
+| Per-wheel setpoints | `u1..u4_desired = 0.0` | Used only when `use_cmd_vel=false` and no twist is active. |
+| PID gains | unchanged from previous defaults | 7 × {Kp, Ki, Kd} sent on every TX frame. |
+
+### 18.5 Firmware-format adjustments — **none required**
+
+The session-2 telemetry/command format works cleanly for ROS 2. The
+host node is the only place that needed change. Some cosmetic mismatches
+remain but are not worth a firmware change:
+
+1. The telemetry key for the heading setpoint is `phi_desired` while
+   the command field is `phi_end`. The host parses both as floats; no
+   ambiguity. **No firmware change.**
+2. `Inertial_x_vel_calc` / `Inertial_y_vel_calc` are world-frame
+   (`q_dot[1]`, `q_dot[2]` in §11). `nav_msgs/Odometry.twist` is
+   conventionally in `child_frame_id`. The host rotates world→body
+   using `ODOM_phi`, so `odom.twist.twist.linear.{x,y}` is body-frame.
+   The firmware could instead emit `vx_body, vy_body` (already
+   computed inside `globalSpeedsFromUMecanum`) as additional keys —
+   marginal benefit, would shave a sin/cos per cycle on the host.
+   **Optional future cleanup**; logged as TODO #10 below.
+3. `Enc_Wheel_Omega{N}` is rev/s; `IMU_w*` is rad/s. Mixed units are
+   acceptable as long as a downstream consumer reading the back-compat
+   `stm32/omegas` topic knows the convention — documented here.
+
+### 18.6 Verification
+
+```
+$ cd omnibase_ws && colcon build --packages-select serial_comm --symlink-install
+Starting >>> serial_comm
+Finished <<< serial_comm [0.96s]
+Summary: 1 package finished [1.07s]
+```
+
+`pyflakes` on the rewritten module — clean. Module-load smoke test
+(import + `yaw_to_quaternion(π/2)`) — clean. No hardware-in-the-loop
+test was performed (no STM32 connected).
+
+### 18.7 Added to TODOS (unresolved questions)
+
+10. **Optional: emit body-frame velocities from firmware.** Inside
+    `globalSpeedsFromUMecanum` the firmware already computes
+    `vx_body` and `vy_body` but only the world-frame `q_dot[1..2]`
+    are printed. Adding `Body_x_vel_calc` and `Body_y_vel_calc` keys
+    to `Start_UART_TX_Task` would let the host publish
+    `Odometry.twist` directly without a sin/cos rotation. Marginal
+    win; touches only the printf format string.
+
