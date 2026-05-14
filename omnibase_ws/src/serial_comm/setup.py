@@ -23,6 +23,7 @@ setup(
     entry_points={
         'console_scripts': [
             'serial_communication = serial_comm.serial_communication:main',
+            'pedro_dashboard = serial_comm.pedro_dashboard:main',
             'simple_rx = serial_comm.simple_rx:main',
         ],
     },

@@ -1139,3 +1139,101 @@ test was performed (no STM32 connected).
     `Odometry.twist` directly without a sin/cos rotation. Marginal
     win; touches only the printf format string.
 
+---
+
+## 19. ROS 2 — PEDRO dashboard node update (session 4)
+
+### 19.1 Files changed
+
+- `omnibase_ws/src/serial_comm/serial_comm/pedro_dashboard.py` —
+  new ROS 2 dashboard node. It subscribes to the topics published by
+  `serial_communication.py` and serves a Socket.IO web dashboard.
+- `omnibase_ws/src/serial_comm/serial_comm/dashboard.html` — replaced
+  the ODrive/CAN-oriented UI with a PEDRO H-bridge/PWM/encoder display.
+- `omnibase_ws/src/serial_comm/setup.py` — added the
+  `pedro_dashboard` console script.
+- `omnibase_ws/src/serial_comm/package.xml` — added web dashboard run
+  dependencies (`python3-flask`, `python3-flask-socketio`).
+
+### 19.2 Dashboard node
+
+Console script:
+
+```
+ros2 run serial_comm pedro_dashboard
+```
+
+Default web UI:
+
+```
+http://localhost:5000
+```
+
+Parameters:
+
+| Name | Default | Effect |
+|---|---|---|
+| `enable_web_gui` | `true` | Starts the Flask + Flask-SocketIO dashboard server. |
+| `web_gui_port` | `5000` | TCP port for the web dashboard. |
+| `stale_timeout_s` | `0.5` | Telemetry age threshold for `STALE`. |
+| `lost_timeout_s` | `2.0` | Telemetry age threshold for `LOST`. |
+
+### 19.3 Subscribed topics
+
+The dashboard does **not** open the STM32 serial port. It only consumes
+ROS topics already published by `serial_communication.py`:
+
+| Topic | Type | Dashboard use |
+|---|---|---|
+| `stm32/raw` | `std_msgs/String` | Telemetry freshness and raw preview. |
+| `stm32/cmd_setpoint` | `geometry_msgs/TwistStamped` | Commanded `vx`, `vy`, `wz`. |
+| `imu/data` | `sensor_msgs/Imu` | Orientation, gyro, linear accel. |
+| `stm32/encoders` | `std_msgs/Int32MultiArray` | TIM1/TIM2/TIM4/TIM8 counters. |
+| `stm32/omegas` | `std_msgs/Float32MultiArray` | Per-wheel measured speed. |
+| `odom` | `nav_msgs/Odometry` | Pose and body-frame twist. |
+| `stm32/pwm` | `std_msgs/Int32MultiArray` | Per-wheel PWM duty, 0..19999. |
+| `stm32/ctrl_u` | `std_msgs/Float32MultiArray` | Commanded wheel speeds. |
+| `stm32/errors` | `std_msgs/Float32MultiArray` | Pose error. |
+| `stm32/u_errors` | `std_msgs/Float32MultiArray` | Per-wheel velocity error. |
+| `stm32/robot_state` | `std_msgs/Int32` | State id, 0=IDLE, 1=RUNNING, 2=STOP, 3=ESTOP. |
+| `stm32/robot_state_name` | `std_msgs/String` | State label. |
+| `stm32_debug` | `std_msgs/String` | Lightweight error-flag hints (`ESTOP`, `STOP`, `ERROR`, `WATCHDOG`, `TIMEOUT`). |
+
+### 19.4 Displayed data
+
+The web dashboard displays:
+
+- Connection status derived from time since the last `stm32/raw`
+  message: `UNKNOWN`, `OK`, `STALE`, or `LOST`.
+- Commanded body velocity (`vx`, `vy`, `wz`).
+- Odometry pose (`x`, `y`, yaw) and body twist.
+- IMU roll/pitch/yaw plus gyro values.
+- Four motor panels with raw encoder count, measured wheel speed,
+  wheel error, PWM duty, and a duty-cycle bar scaled to the 19999
+  firmware PWM period.
+- Robot state machine status and error flags.
+- Raw STM32 telemetry preview.
+
+All ODrive/CAN-specific fields and actions were removed: no axis state,
+node id, bus voltage/current, ODrive configuration, CAN status, startup,
+clear-errors, reboot, or calibration controls remain in the PEDRO UI.
+
+### 19.5 Verification
+
+`python3 -m py_compile` passed for
+`serial_comm/serial_comm/pedro_dashboard.py` and
+`serial_comm/serial_comm/serial_communication.py`.
+
+The ROS 2 package build also passed:
+
+```
+cd /home/roger/Github/pedro_ws/omnibase_ws
+colcon build --packages-select serial_comm --symlink-install
+```
+
+Result:
+
+```
+Finished <<< serial_comm [1min 1s]
+Summary: 1 package finished [1min 1s]
+```
