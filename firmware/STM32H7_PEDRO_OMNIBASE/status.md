@@ -706,3 +706,306 @@ Will **not** be copied into PEDRO_OMNIBASE. Everything below is OMNIBASE-only, O
 19. MCP2515 (`mcp2515.c/h`, `mcp2515_consts.h`, `can.h`) — present in both PEDRO and PEDRO_OMNIBASE source tree but not initialised in OMNIBASE's main; drop if user confirms no MCP CAN need.
 20. Telemetry fields specific to ODrive axes: `N<i>, E<i>, S<i>, C<i>, P<i>, V<i>, Sh<i>, CPR<i>, Vbus<i>, Ibus<i>, IqSet<i>, IqMeas<i>, U<i>` — PEDRO will emit `TIMx`, `Enc_Wheel_OmegaN`, `Ctrl_duty_uN` instead (already in PEDRO format).
 21. `BT_active`, `BT_vx`, `BT_vy`, `BT_wz`, `ESP32_age_ms` telemetry — only if §3 of the merge plan is executed.
+
+---
+
+## EXECUTED MERGE — files changed / added / removed
+
+All changes are inside `STM32H7_PEDRO_OMNIBASE/`; the original `STM32H7_PEDRO/`
+tree is untouched.
+
+### Files added (copied verbatim from `STM32H7_OMNIBASE_CAN_BNO085`)
+
+| Path | Source |
+|---|---|
+| `CM7/Core/Inc/sh2_hal_impl.h` | OMNIBASE `CM7/Core/Inc/sh2_hal_impl.h` |
+| `CM7/Core/Src/sh2_hal_impl.c` | OMNIBASE `CM7/Core/Src/sh2_hal_impl.c` |
+| `CM7/Core/Inc/sh2/euler.h`            | OMNIBASE `…/Inc/sh2/euler.h` |
+| `CM7/Core/Inc/sh2/sh2.h`              | OMNIBASE `…/Inc/sh2/sh2.h` |
+| `CM7/Core/Inc/sh2/sh2_err.h`          | OMNIBASE `…/Inc/sh2/sh2_err.h` |
+| `CM7/Core/Inc/sh2/sh2_hal.h`          | OMNIBASE `…/Inc/sh2/sh2_hal.h` |
+| `CM7/Core/Inc/sh2/sh2_SensorValue.h`  | OMNIBASE `…/Inc/sh2/sh2_SensorValue.h` |
+| `CM7/Core/Inc/sh2/sh2_util.h`         | OMNIBASE `…/Inc/sh2/sh2_util.h` |
+| `CM7/Core/Inc/sh2/shtp.h`             | OMNIBASE `…/Inc/sh2/shtp.h` |
+| `CM7/Core/Src/sh2/euler.c`            | OMNIBASE `…/Src/sh2/euler.c` |
+| `CM7/Core/Src/sh2/sh2.c`              | OMNIBASE `…/Src/sh2/sh2.c` |
+| `CM7/Core/Src/sh2/sh2_SensorValue.c`  | OMNIBASE `…/Src/sh2/sh2_SensorValue.c` |
+| `CM7/Core/Src/sh2/sh2_util.c`         | OMNIBASE `…/Src/sh2/sh2_util.c` |
+| `CM7/Core/Src/sh2/shtp.c`             | OMNIBASE `…/Src/sh2/shtp.c` |
+
+### Files modified
+
+- **`CM7/Core/Inc/main.h`**
+  - `IMUData` extended with `qx,qy,qz,qw,wx,wy,wz,ax,ay,az` (rotation
+    vector, body-frame gyro rad/s, linear accel m/s² gravity-removed).
+  - Added `RobotState` enum (`ROBOT_STATE_IDLE/RUNNING/STOP/ESTOP`).
+  - Added `BNO085_RST_Pin (PD15)`, `BNO085_INT_Pin (PD14)`,
+    `BNO085_WAKE_Pin (PA4)` private defines.
+  - Added Nucleo `LD1_Pin (PB0)`, `LD2_Pin (PE1)`, `LD3_Pin (PB14)` and
+    `DEBUG_LEDS` compile-time switch (default 0).
+  - Added `CMD_WATCHDOG_TIMEOUT_MS = 500` and `ESTOP_CMD_KEY = -9999.0`.
+  - `CtrlTsk_Data` gained a `robot_state` byte for telemetry.
+
+- **`CM7/Core/Src/main.c`** — substantial restructure:
+  - Removed direct calls to `bno055_*` and `mcp2515_*`. `bno055_stm32.h`
+    is still included (so `bno055.c` continues to find its glue at link
+    time) but no BNO055 function is called.
+  - Added `#include` for `sh2.h`, `sh2_hal_impl.h`, `sh2_SensorValue.h`,
+    `sh2_err.h`, `sh2_hal.h`, `euler.h`.
+  - `MX_I2C1_Init()` is now called from `main()`; `MX_SPI1_Init()` is
+    not (MCP2515 is dropped — PD14 reused for BNO085 INT).
+  - `MX_GPIO_Init()` now also configures `PD14` (BNO085 INT, pull-up
+    input), `PD15` (BNO085 RST, output idle HIGH), `PA4` (BNO085 WAKE,
+    output idle HIGH), and conditionally configures `PB0/PE1/PB14` as
+    LED outputs when `DEBUG_LEDS` is set.
+  - File-scope additions: `g_bno085_yaw/pitch/roll/qx/.../az` shared
+    floats, `g_last_cmd_tick`, `g_wheel_sign[4] = {-1, +1, -1, +1}`
+    (matches OMNIBASE main.c:2081 exactly), `IMU_TaskHandle`.
+  - `StartIMUTask` ported verbatim from OMNIBASE (50 Hz rotation vector,
+    gyro, linear-accel reports). Created in `main()` at priority
+    AboveNormal / stack 4096.
+  - `computeNecessaryWheelSpeedsMecanum` now matches OMNIBASE main.c:
+    311-317 signs (`u[2]` phi_dot sign flipped from PEDRO's original).
+  - `globalSpeedsFromUMecanum` replaced with OMNIBASE main.c:319-347
+    corrected forward kinematics.
+  - `start_UART_RX_Task` updates `g_last_cmd_tick` on every successful
+    30-float parse so the watchdog clears. Default `data` initialiser
+    seeds `x_off = y_off = 0.195`, `r = 0.0762`.
+  - `Start_UART_TX_Task` switched to non-blocking queue reads and emits
+    nine new BNO085 telemetry keys plus the `robot_state` byte.
+  - `StartControlTask` rewritten around the `RobotState` machine:
+    - Sense → encoders + IMU globals + tick delta
+    - Read command queue (non-blocking) — first non-ESTOP command
+      promotes `IDLE/STOP → RUNNING`; `x_desired == ESTOP_CMD_KEY`
+      latches `ESTOP`.
+    - Watchdog — `RUNNING → STOP` if no command for
+      `CMD_WATCHDOG_TIMEOUT_MS` (500 ms), motors zeroed and braked.
+    - Compute u[] either by twist-mode IK (`x_desired`, `y_desired`,
+      `phi_end` non-zero, all u_desired = 0) or per-wheel passthrough.
+    - Apply `g_wheel_sign[i]` on the command side; per-wheel PID on
+      `wheel_sign[i]*u_cmd − ω_meas`; deadzone/saturation; signed PWM
+      split into direction + duty.
+    - Production path drives `TIM5/12/14/15` and `setMotorDirection()`
+      on `PD4/5/6/7` + `PE2/4/3/6`.
+    - `DEBUG_LEDS=1` path holds all H-bridge pins in brake, zeros all
+      PWM compare registers, and instead lights LD1 (M0||M2 active)
+      and LD2 (M1||M3 active). LD3 (PB14) is skipped because PB14 is
+      M1's PWM output (TIM12_CH1).
+    - Odometry: undo `wheel_sign` on measured ω, call
+      `globalSpeedsFromUMecanum(odom->phi, x_off, y_off, radius, …)`,
+      integrate q_dot into `odom`, wrap φ ∈ (−π, π].
+  - `StartDefaultTask` body reduced to an idle stub (was the legacy
+    MCP2515/ODrive test loop).
+  - `MutexUART_DataHandle` is still created (CubeMX-generated) but never
+    used — left in place to avoid touching CubeMX-generated init code.
+
+- **`CM7/.cproject`**
+  - Added `../Core/Inc/sh2` to the assembler and C-compiler include
+    paths in both Debug and Release configurations.
+
+### Files not deleted but now dead in the merged build
+
+- `CM7/Core/Inc/bno055.h`, `CM7/Core/Inc/bno055_stm32.h`,
+  `CM7/Core/Src/bno055.c` — BNO055 driver. Still compiled. Its glue
+  functions live in `bno055_stm32.h` which `main.c` keeps including so
+  the link resolves. `--gc-sections` strips the bodies.
+- `CM7/Core/Inc/mcp2515.h`, `CM7/Core/Inc/mcp2515_consts.h`,
+  `CM7/Core/Inc/can.h`, `CM7/Core/Src/mcp2515.c` — MCP2515 driver.
+  Still compiled (depends on `hspi1` which is still declared) but the
+  symbols are unreferenced and stripped at link.
+- `MX_SPI1_Init()` function body remains (CubeMX-generated) but the
+  call from `main()` is commented out.
+
+---
+
+## FINAL TELEMETRY FORMAT (STM32 → host, USART3, 115200 8-N-1)
+
+One line per ~100 Hz cycle from `Start_UART_TX_Task`, comma-separated
+`key=value` pairs, `\r\n`-terminated. Field order (matches the order in
+the `printf`):
+
+```
+x_desired, y_desired, phi_desired, d, r,
+roll, pitch, yaw,                                ← BNO085 rotation-vector, radians
+IMU_qx, IMU_qy, IMU_qz, IMU_qw,                  ← quaternion (ROS x,y,z,w)
+IMU_wx, IMU_wy, IMU_wz,                          ← gyro, rad/s, body frame
+IMU_ax, IMU_ay, IMU_az,                          ← linear accel, m/s², gravity removed
+TIM1, TIM2, TIM4, TIM8,                          ← raw uint16 encoder counters
+Enc_Wheel_Omega1..4,                             ← rev/s per wheel (signed)
+Inertial_ang_vel_calc,
+Inertial_x_vel_calc, Inertial_y_vel_calc,        ← odom q_dot
+ODOM_phi, ODOM_x_pos, ODOM_y_pos,                ← integrated pose (φ wrapped)
+ODOM_Err_x, ODOM_Err_y, ODOM_Err_phi,
+U_Err_1..4,                                      ← per-wheel ω error (cmd − meas)
+Ctrl_Inertial_x_dot, Ctrl_Inertial_y_dot,
+Ctrl_Inertial_phi_dot,
+Ctrl_necc_u1..4,                                 ← commanded wheel ω (rev/s, pre-sign)
+ts_current, ts_previous, ts_delta,               ← FreeRTOS ticks (ms)
+Ctrl_duty_u1..4,                                 ← uint16, 0..19999, post-deadzone
+robot_state,                                     ← 0=IDLE, 1=RUNNING, 2=STOP, 3=ESTOP
+xKp, xKi, xKd,  yKp, yKi, yKd,  phiKp, phiKi, phiKd,
+u0Kp, u0Ki, u0Kd,  u1Kp, u1Ki, u1Kd,
+u2Kp, u2Ki, u2Kd,  u3Kp, u3Ki, u3Kd
+```
+
+The original PEDRO telemetry keys are all preserved — the host
+`serial_comm/serial_communication.py` regex `(\w+)=(...)` picks up any
+new keys via its dict-based decoder, and the new keys are additive
+(`IMU_q*`, `IMU_w*`, `IMU_a*`, `robot_state`).
+
+---
+
+## FINAL UART COMMAND FORMAT (host → STM32, USART3, 115200 8-N-1)
+
+`start_UART_RX_Task` accepts the **same 30 space-separated floats** the
+original PEDRO firmware accepted, `\n` or `\r` terminated. Field order:
+
+```
+x_desired  y_desired  phi_end  d  r
+u1_desired  u2_desired  u3_desired  u4_desired
+x_Kp  x_Ki  x_Kd
+y_Kp  y_Ki  y_Kd
+phi_Kp phi_Ki phi_Kd
+u0_Kp u0_Ki u0_Kd
+u1_Kp u1_Ki u1_Kd
+u2_Kp u2_Ki u2_Kd
+u3_Kp u3_Ki u3_Kd
+```
+
+Types: `x_desired..r` are `double`; `u1..u4_desired` and all 21 PID
+gains are `float`. The host node `pedro_ws/omnibase_ws/src/serial_comm/
+serial_comm/serial_communication.py` already produces this line at
+10 Hz — no client-side change required.
+
+Semantics inside `StartControlTask`:
+
+- If `u1..u4_desired` are **all zero** and at least one of
+  `x_desired/y_desired/phi_end` is non-zero, the firmware interprets the
+  line as a body-frame twist: `vx = x_desired`, `vy = y_desired`,
+  `wz = phi_end`, and runs `computeNecessaryWheelSpeedsMecanum(phi=0,
+  0.195, 0.195, 0.0762, …)` to fill `u[0..3]`. This matches the OMNIBASE
+  Type-1 SET_VEL semantics with the corrected mecanum signs.
+- Otherwise the firmware treats `u1..u4_desired` as direct per-wheel
+  angular-velocity setpoints (PEDRO's original behaviour).
+- **ESTOP sentinel**: any line with `x_desired == -9999.0`
+  (`ESTOP_CMD_KEY`) latches `ROBOT_STATE_ESTOP` for the remainder of the
+  session — only an MCU reset clears it.
+- Watchdog: if no successfully-parsed line arrives within 500 ms
+  (`CMD_WATCHDOG_TIMEOUT_MS`) while in RUNNING, the SM falls to STOP and
+  motors are zeroed. A subsequent valid command re-enters RUNNING.
+
+The host node has no concept of "STOP" or "ESTOP" — those are emitted
+purely by the firmware's `robot_state` telemetry field.
+
+---
+
+## STATE MACHINE — final transition table
+
+```
+                  ┌────────── any non-ESTOP cmd ─────────┐
+                  │                                      ▼
+   ┌──── IDLE ────┤                                  RUNNING ─── ESTOP cmd ──► ESTOP
+   │              │                                      │
+   │              └──── ESTOP cmd ──► ESTOP              ├── no cmd 500 ms ──► STOP
+   │                                                      │
+   │                                  ┌── any non-ESTOP cmd ─┘
+   │                                  ▼
+   │                               RUNNING
+   │
+   └──► (on boot / reset) initial state
+```
+
+- `STOP → RUNNING` on the next valid (non-ESTOP) command line.
+- `ESTOP → *` requires a hardware reset.
+- All non-RUNNING states force `dutyCycles[]=0`, `M_dirs[]=brake` and
+  reset all per-wheel PID integral accumulators to zero.
+
+---
+
+## TODOS (unresolved questions / unknowns)
+
+Each item below was not invented; the answer is genuinely unknown from
+the available source code and needs hardware verification or a design
+decision before the firmware ships.
+
+1. **BNO085 wiring (PD14 INT, PD15 RST, PA4 WAKE).** These pins are
+   borrowed from `STM32H7_OMNIBASE_CAN_BNO085` because no CubeMX
+   schematic exists for the PEDRO frame with the BNO085 installed. They
+   may need to change once the user wires the sensor into the real
+   PEDRO board. `PD14` was MCP2515_CS in the original PEDRO design — we
+   freed it by dropping the MCP2515 path. The `.ioc` file has not been
+   regenerated to reflect this; next time CubeMX is opened it may
+   re-overwrite `MX_GPIO_Init` if the user lets it.
+
+2. **Wheel-index → physical wheel-position mapping.** Neither PEDRO
+   nor OMNIBASE source labels which of FL/FR/RL/RR each `u[i]`
+   corresponds to. We preserved the OMNIBASE wheel_sign pattern
+   `{-1, +1, -1, +1}` verbatim, but the *physical* mounting of motors
+   M0..M3 on PEDRO must be confirmed against OMNIBASE for the IK/FK to
+   produce correct global frame motion. Two practical checks:
+   - With a unit `x_desired = +1.0` (forward), all wheels should spin
+     **forward** in the robot frame. After the `wheel_sign` flip,
+     motors 0 and 2 will see a *negative* PWM command — verify that
+     direction physically corresponds to "forward" for each wheel.
+   - With a unit `phi_end = +1.0` (yaw CCW), the IK output sign pattern
+     should be `(−, +, −, +)` after `wheel_sign`. Confirm this matches
+     OMNIBASE's behaviour in hardware.
+
+3. **PEDRO frame `x_off` / `y_off`.** Hardcoded to `0.195 m` (matching
+   OMNIBASE's mecanum base). PEDRO may have a different wheelbase —
+   measure and update the constants in `StartControlTask` and the
+   `data` initialisers in `start_UART_RX_Task` / `Start_UART_TX_Task`.
+
+4. **PEDRO wheel `radius`.** Hardcoded to `0.0762 m` (OMNIBASE value).
+   Verify against the actual wheels mounted on PEDRO and update if
+   different.
+
+5. **PB14 conflict in DEBUG_LEDS mode.** Nucleo-H755 LD3 is `PB14`,
+   which is also `TIM12_CH1` (M1 PWM). When `DEBUG_LEDS=1` we skip LD3
+   to avoid double-driving the pin, but M1's PWM is still configured by
+   `MX_TIM12_Init()` even though `__HAL_TIM_SET_COMPARE` writes 0 in
+   the loop. If you want LD3 to actually light, comment out the
+   `HAL_TIM_PWM_Start(&htim12, …)` call in `main()` under the same
+   `#if DEBUG_LEDS` and add explicit LD3 toggling in the loop.
+
+6. **R_counts = 424.0** is the small-motor encoder constant. The
+   original PEDRO comment lists `17380.0` for "motores grandes". If the
+   physical motors on PEDRO_OMNIBASE differ, update this constant.
+
+7. **ESP32 Bluetooth path.** Not ported. USART2 (PD5/PD6) is consumed
+   by H-bridge IN2/IN3 on PEDRO, so adding the BT path requires
+   re-routing USART2 to alternate pins (PA2/PA3 candidate). Skipped
+   per merge plan §3.
+
+8. **No hardware IWDG/WWDG.** The watchdog is purely software (the
+   500 ms command timeout in `StartControlTask`). If the firmware
+   itself hangs (e.g. inside the SH2 service loop) the motors keep
+   their last duty cycle. Consider enabling IWDG once the rest of the
+   path is verified.
+
+9. **ESTOP recovery.** Currently latches until MCU reset. If the host
+   wants to clear ESTOP without a power-cycle, add a "clear" sentinel
+   (e.g. `x_desired = -9998.0`) and a transition `ESTOP → IDLE`.
+
+---
+
+## SYNTAX / COMPILE CHECK
+
+`arm-none-eabi-gcc` is not installed on this machine, so no compile
+check ran. Manual review focus:
+
+- `main.c` includes match the SH2 library headers exactly as in
+  OMNIBASE (`#include "sh2.h"` etc.); the `../Core/Inc/sh2` include path
+  is added in `CM7/.cproject`.
+- All references to `bno055_*` and `mcp2515_*` functions are removed
+  from the control-path code. `bno055_stm32.h` is still included to
+  satisfy `bno055.c`'s link; `mcp2515.c` links against `hspi1` which is
+  still declared.
+- `MX_I2C1_Init()` is called from `main()`; `MX_SPI1_Init()` is not.
+- `StartIMUTask` is forward-declared with the other task prototypes
+  and instantiated in `main()` via `osThreadNew`.
+- All Cortex-M7 atomic-float reads/writes for `g_bno085_*` are 32-bit
+  aligned (file-scope `volatile float`); no mutex is required.
+- Queue reads in `StartControlTask` and `Start_UART_TX_Task` are
+  non-blocking (timeout = 0), so a stalled producer no longer deadlocks
+  consumers (the old `osWaitForever` reads were a latent bug).

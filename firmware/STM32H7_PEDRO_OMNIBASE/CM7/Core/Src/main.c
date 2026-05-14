@@ -25,10 +25,30 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
-#include "bno055_stm32.h"
-#include "uart_rx.h"
+#include <stdbool.h>
 #include <string.h>
-#include "mcp2515.h"
+#include "uart_rx.h"
+
+/* BNO085 SH2 stack (replaces the BNO055 driver from the original PEDRO build). */
+#include "sh2_hal_impl.h"
+#include "sh2.h"
+#include "sh2_err.h"
+#include "sh2_hal.h"
+#include "sh2_SensorValue.h"
+#include "euler.h"
+
+/* The MCP2515 driver and BNO055 driver remain in the source tree (so the
+ * original PEDRO build path is preserved) but are not referenced by the
+ * merged PEDRO_OMNIBASE main.c — MCP2515 is replaced by BNO085 on PD14/PD15.
+ *
+ * bno055_stm32.h defines the I2C glue functions (bno055_writeData /
+ * bno055_readData / bno055_delay / bno055_assignI2C) as non-static globals
+ * directly inside the header. We include the header here — but never call
+ * any of its functions — so that bno055.c (which is still in Core/Src) has
+ * symbols to link against. The functions and the bno055.c body are dead
+ * code in this build and the linker discards them under -ffunction-sections
+ * + --gc-sections. Remove bno055.c from the build to drop them entirely. */
+#include "bno055_stm32.h"
 
 /* USER CODE END Includes */
 
@@ -148,6 +168,64 @@ osMessageQueueId_t kpids_UART_TX_QueueHandle;
 const osMessageQueueAttr_t kpids_UART_TX_Queue_attributes = {
   .name = "kpids_UART_TX_Queue"
 };
+
+/* BNO085 SH2 service task (replaces the dead-code BNO055 path). */
+osThreadId_t IMU_TaskHandle;
+const osThreadAttr_t IMU_Task_attributes = {
+  .name = "IMU_Task",
+  .stack_size = 1024 * 4,
+  .priority = (osPriority_t) osPriorityAboveNormal,
+};
+
+/*
+ * BNO085 shared orientation data (written by IMU_Task, read by ControlTask).
+ * 32-bit float reads/writes are atomic on Cortex-M7 — no mutex needed.
+ * Units: rotation vector in radians (yaw/pitch/roll derived via q_to_ypr),
+ *        gyro in rad/s, linear accel in m/s^2 with gravity already removed.
+ */
+volatile float g_bno085_yaw   = 0.0f;
+volatile float g_bno085_pitch = 0.0f;
+volatile float g_bno085_roll  = 0.0f;
+volatile float g_bno085_qx = 0.0f;
+volatile float g_bno085_qy = 0.0f;
+volatile float g_bno085_qz = 0.0f;
+volatile float g_bno085_qw = 1.0f;
+volatile float g_bno085_wx = 0.0f;
+volatile float g_bno085_wy = 0.0f;
+volatile float g_bno085_wz = 0.0f;
+volatile float g_bno085_ax = 0.0f;
+volatile float g_bno085_ay = 0.0f;
+volatile float g_bno085_az = 0.0f;
+
+/* Set to 1 by the async event callback on SH2_RESET; the service loop reacts
+ * by re-enabling reports and then clears the flag. */
+static volatile uint8_t g_bno085_sensor_ready = 0;
+static volatile uint8_t g_bno085_running = 0; /* 1 once enable_all_reports has succeeded */
+
+#define BNO085_REPORT_INTERVAL_US 20000U   /* 50 Hz */
+
+/*
+ * Shared command tick (ms). Updated by start_UART_RX_Task on every parsed line.
+ * ControlTask polls it for the watchdog. UINT32_MAX sentinel = no command yet.
+ */
+volatile uint32_t g_last_cmd_tick = 0;
+
+/*
+ * Mecanum wheel-position / sign convention — must match OMNIBASE_CAN_BNO085
+ * CM7/Core/Src/main.c:2081 exactly:
+ *     wheel_sign[4] = { -1.0, 1.0, -1.0, 1.0 };
+ * Wheel-index → physical wheel position is not labelled in either firmware;
+ * see status.md §"Mecanum mapping" for what the sign pattern implies
+ * (motors 0 and 2 are on the same diagonal as motors mirrored vs 1 and 3).
+ *
+ * Index → motor (matches PEDRO's existing PWM/DIR table):
+ *   M0 → PWM PA0  (TIM5_CH1) , DIR PD4/PD5
+ *   M1 → PWM PB14 (TIM12_CH1), DIR PD6/PD7
+ *   M2 → PWM PF9  (TIM14_CH1), DIR PE2/PE4
+ *   M3 → PWM PE5  (TIM15_CH1), DIR PE3/PE6
+ */
+static const double g_wheel_sign[4] = { -1.0, 1.0, -1.0, 1.0 };
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -170,6 +248,7 @@ void StartDefaultTask(void *argument);
 void start_UART_RX_Task(void *argument);
 void Start_UART_TX_Task(void *argument);
 void StartControlTask(void *argument);
+void StartIMUTask(void *argument);
 
 /* USER CODE BEGIN PFP */
 
@@ -264,11 +343,14 @@ int computeNecessaryWheelSpeedsOmni(double phi, double d, double r, double u[4],
 * @return Always returns 0.
 */
 int computeNecessaryWheelSpeedsMecanum(double phi, double x_off, double y_off, double r, double u[4], double phi_dot, double y_dot, double x_dot) {
-	u[0] = (x_dot*(cos(phi) + sin(phi)) - y_dot*(cos(phi) - sin(phi)) - phi_dot*(x_off + y_off)) / r;
+    /* Mecanum IK — signs taken verbatim from
+     * STM32H7_OMNIBASE_CAN_BNO085/CM7/Core/Src/main.c:311-317 so that the
+     * forward-kinematics in globalSpeedsFromUMecanum round-trips against this
+     * IK. The previous PEDRO version had the u[2] phi_dot sign flipped. */
+    u[0] = (x_dot*(cos(phi) + sin(phi)) - y_dot*(cos(phi) - sin(phi)) - phi_dot*(x_off + y_off)) / r;
     u[1] = (x_dot*(cos(phi) - sin(phi)) + y_dot*(cos(phi) + sin(phi)) + phi_dot*(x_off + y_off)) / r;
-    u[2] = (x_dot*(cos(phi) + sin(phi)) - y_dot*(cos(phi) - sin(phi)) + phi_dot*(x_off + y_off)) / r;
-    u[3] = (x_dot*(cos(phi) - sin(phi)) + y_dot*(cos(phi) + sin(phi)) - phi_dot*(x_off + y_off)) / r;
-
+    u[2] = (x_dot*(cos(phi) - sin(phi)) + y_dot*(cos(phi) + sin(phi)) - phi_dot*(x_off + y_off)) / r;
+    u[3] = (x_dot*(cos(phi) + sin(phi)) - y_dot*(cos(phi) - sin(phi)) + phi_dot*(x_off + y_off)) / r;
     return 0;
 }
 
@@ -311,10 +393,24 @@ int globalSpeedsFromUOmni(double phi, double d, double r, double u[4], double q_
 * @return Always returns 0.
 */
 int globalSpeedsFromUMecanum(double phi, double x_off, double y_off, double r, double u[4], double q_dot[3]) {
-    q_dot[0] = (u[1] - u[0] + u[2] - u[3]) / ((4 * (x_off + y_off)) / r); // Angular velocity
-    q_dot[1] = cos(phi)*(r/4)*(u[0] + u[1] + u[2] + u[3]) + sin(phi)*(r/4)*(u[0] - u[1] + u[2] - u[3]); // X velocity
-    q_dot[2] = sin(phi)*(r/4)*(u[0] + u[1] + u[2] + u[3]) - cos(phi)*(r/4)*(u[0] - u[1] + u[2] - u[3]); // X velocity
+    /* Forward kinematics — corrected version from
+     * STM32H7_OMNIBASE_CAN_BNO085/CM7/Core/Src/main.c:319-347.
+     *
+     * Body-frame velocities from wheel angular velocities (round-trips with
+     * the IK signs above):
+     *     +x body  →  ( +, +, +, + )       = u[0]+u[1]+u[2]+u[3]
+     *     +y body  →  ( -, +, +, - )       = -u[0]+u[1]+u[2]-u[3]
+     *     +phi     →  ( -, +, -, + )       = -u[0]+u[1]-u[2]+u[3]
+     * The world-frame x/y velocities are then obtained by rotating by phi.
+     */
+    const double L = x_off + y_off;
+    const double vx_body = (r / 4.0) * ( u[0] + u[1] + u[2] + u[3]);
+    const double vy_body = (r / 4.0) * (-u[0] + u[1] + u[2] - u[3]);
+    const double phi_dot = (r / (4.0 * L)) * (-u[0] + u[1] - u[2] + u[3]);
 
+    q_dot[0] = phi_dot;
+    q_dot[1] = cos(phi) * vx_body - sin(phi) * vy_body;
+    q_dot[2] = sin(phi) * vx_body + cos(phi) * vy_body;
     return 0;
 }
 
@@ -408,8 +504,10 @@ Error_Handler();
   MX_TIM13_Init();
   MX_TIM14_Init();
   MX_TIM15_Init();
-//  MX_I2C1_Init();
-  MX_SPI1_Init();
+  MX_I2C1_Init();      /* BNO085 on I2C1 (PB6/PB7) */
+  /* SPI1 / MCP2515 path is disabled in the merged PEDRO_OMNIBASE build —
+   * PD14 is reused by the BNO085 INT line and CAN is no longer needed. */
+  /* MX_SPI1_Init(); */
   /* USER CODE BEGIN 2 */
 
   uint8_t allOK = 1;
@@ -483,11 +581,7 @@ Error_Handler();
   /* USER CODE END RTOS_TIMERS */
 
   /* Create the queue(s) */
-  /* creation of UART_Queue */
-  UART_QueueHandle = osMessageQueueNew (10, sizeof(double), &UART_Queue_attributes);
-
   /* USER CODE BEGIN RTOS_QUEUES */
-  /* add queues, ... */
   UART_QueueHandle = osMessageQueueNew (3, sizeof(InputData), &UART_Queue_attributes);
   UART2CtrlTsk_QueueHandle = osMessageQueueNew (3, sizeof(InputData), &UART2CtrlTsk_Queue_attributes);
   CtrlTsk_QueueHandle = osMessageQueueNew (3, sizeof(CtrlTsk_Data), &CtrlTsk_Queue_attributes);
@@ -496,8 +590,8 @@ Error_Handler();
   /* USER CODE END RTOS_QUEUES */
 
   /* Create the thread(s) */
-  /* creation of defaultTask */
-//  defaultTaskHandle = osThreadNew(StartDefaultTask, NULL, &defaultTask_attributes);
+  /* The legacy MCP2515/ODrive test default task is intentionally not created
+   * in the merged PEDRO_OMNIBASE build. */
 
   /* creation of UART_RX_Task */
   UART_RX_TaskHandle = osThreadNew(start_UART_RX_Task, NULL, &UART_RX_Task_attributes);
@@ -509,7 +603,8 @@ Error_Handler();
   ControlTaskHandle = osThreadNew(StartControlTask, NULL, &ControlTask_attributes);
 
   /* USER CODE BEGIN RTOS_THREADS */
-  /* add threads, ... */
+  /* BNO085 SH2 service task (ported from OMNIBASE_CAN_BNO085). */
+  IMU_TaskHandle = osThreadNew(StartIMUTask, NULL, &IMU_Task_attributes);
   /* USER CODE END RTOS_THREADS */
 
   /* USER CODE BEGIN RTOS_EVENTS */
@@ -1245,28 +1340,70 @@ static void MX_GPIO_Init(void)
    /*Configure GPIO pin Output Level */
    HAL_GPIO_WritePin(GPIOD, PD4_Pin|PD5_Pin|PD6_Pin|PD7_Pin, GPIO_PIN_RESET);
    HAL_GPIO_WritePin(GPIOE, PE2_Pin|PE4_Pin|PE3_Pin|PE6_Pin, GPIO_PIN_RESET);
-   HAL_GPIO_WritePin(GPIOG, MCP2515_CS_Pin, GPIO_PIN_RESET);
 
-   // Declare IN1, IN2, IN3 IN4 of H Bridge, in that order
+   /* H-Bridge 1 IN1..IN4 = PD4/PD5/PD6/PD7 (motors M0 & M1 direction). */
    GPIO_InitStruct.Pin = PD4_Pin|PD5_Pin|PD6_Pin|PD7_Pin;
    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
    GPIO_InitStruct.Pull = GPIO_NOPULL;
    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
    HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
 
-
-   GPIO_InitStruct.Pin = MCP2515_CS_Pin;
-   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-   GPIO_InitStruct.Pull = GPIO_NOPULL;
-   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
-   HAL_GPIO_Init(MCP2515_CS_GPIO_Port, &GPIO_InitStruct);
-
-   // Declare IN1, IN2, IN3 IN4 of H Bridge, in that order
+   /* H-Bridge 2 IN1..IN4 = PE2/PE4/PE3/PE6 (motors M2 & M3 direction).
+    * Note pair ordering: M2 uses PE2&PE4, M3 uses PE3&PE6 — preserved from
+    * the original PEDRO main.c (setMotorDirection calls in StartControlTask). */
    GPIO_InitStruct.Pin = PE2_Pin|PE4_Pin|PE3_Pin|PE6_Pin;
    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
    GPIO_InitStruct.Pull = GPIO_NOPULL;
    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
    HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
+
+   /* BNO085 RST = PD15, idle HIGH (sensor not in reset). */
+   HAL_GPIO_WritePin(BNO085_RST_GPIO_Port, BNO085_RST_Pin, GPIO_PIN_SET);
+   GPIO_InitStruct.Pin   = BNO085_RST_Pin;
+   GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
+   GPIO_InitStruct.Pull  = GPIO_NOPULL;
+   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+   HAL_GPIO_Init(BNO085_RST_GPIO_Port, &GPIO_InitStruct);
+
+   /* BNO085 INT = PD14, input with pull-up (sensor drives LOW when data ready).
+    * Reuses the pin originally allocated to MCP2515_CS — MCP2515 is not
+    * initialised in this merged target so the pin is free. */
+   GPIO_InitStruct.Pin   = BNO085_INT_Pin;
+   GPIO_InitStruct.Mode  = GPIO_MODE_INPUT;
+   GPIO_InitStruct.Pull  = GPIO_PULLUP;
+   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+   HAL_GPIO_Init(BNO085_INT_GPIO_Port, &GPIO_InitStruct);
+
+   /* BNO085 WAKE/PS0 = PA4, idle HIGH (optional but configured to match
+    * OMNIBASE_CAN_BNO085 verbatim — see status.md TODO for confirmation). */
+   HAL_GPIO_WritePin(BNO085_WAKE_GPIO_Port, BNO085_WAKE_Pin, GPIO_PIN_SET);
+   GPIO_InitStruct.Pin   = BNO085_WAKE_Pin;
+   GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
+   GPIO_InitStruct.Pull  = GPIO_NOPULL;
+   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+   HAL_GPIO_Init(BNO085_WAKE_GPIO_Port, &GPIO_InitStruct);
+
+#if DEBUG_LEDS
+   /* Nucleo-H755 on-board LEDs for desk-test mode:
+    *   LD1 = PB0  (green)  — mirrored from M0 duty (highest bit)
+    *   LD2 = PE1  (yellow) — mirrored from M1 duty
+    *   LD3 = PB14 (red)    — mirrored from M2 duty (clashes with TIM12_CH1 PWM)
+    * Only configured when DEBUG_LEDS != 0. */
+   HAL_GPIO_WritePin(LD1_GPIO_Port, LD1_Pin, GPIO_PIN_RESET);
+   GPIO_InitStruct.Pin   = LD1_Pin;
+   GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
+   GPIO_InitStruct.Pull  = GPIO_NOPULL;
+   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+   HAL_GPIO_Init(LD1_GPIO_Port, &GPIO_InitStruct);
+
+   HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
+   GPIO_InitStruct.Pin   = LD2_Pin;
+   HAL_GPIO_Init(LD2_GPIO_Port, &GPIO_InitStruct);
+
+   HAL_GPIO_WritePin(LD3_GPIO_Port, LD3_Pin, GPIO_PIN_RESET);
+   GPIO_InitStruct.Pin   = LD3_Pin;
+   HAL_GPIO_Init(LD3_GPIO_Port, &GPIO_InitStruct);
+#endif
 
 //   GPIOD->ODR ^= (0x1UL << 4U);
 //   GPIOD->ODR ^= (0x1UL << 5U);
@@ -1297,113 +1434,12 @@ static void MX_GPIO_Init(void)
 void StartDefaultTask(void *argument)
 {
   /* USER CODE BEGIN 5 */
-    MX_SPI1_Init();
-
-    static struct can_frame tx_frame;
-    static struct can_frame rx_frame;
-    CAN_Error err;
-
-    err = MCP_reset();
-    if (err != ERROR_OK) {
-        printf("MCP_reset failed! Error code: %d\n\r", err);
-        return;  // abort or handle error
-    }
-
-    // 2. Bitrate (optional: can remove if using setBitrateClock only)
-    err = MCP_setBitrate(CAN_500KBPS);
-    if (err != ERROR_OK) {
-        printf("MCP_setBitrate failed! Error code: %d\n\r", err);
-        return;
-    }
-
-    // 3. Bitrate + Clock
-    err = MCP_setBitrateClock(CAN_500KBPS, MCP_8MHZ);
-    if (err != ERROR_OK) {
-        printf("MCP_setBitrateClock failed! Error code: %d\n\r", err);
-        return;
-    }
-
-    osDelay(10);
-
-    err = MCP_setNormalMode();
-    if (err != ERROR_OK) {
-        printf("Failed to enter Normal mode! Error code: %d\n\r", err);
-    } else {
-        printf("MCP2515 is in Normal mode\n\r");
-    }
-
-    uint8_t canstat = MCP_readRegister(0x0E);  // 0x0E
-    uint8_t mode = canstat & 0xE0;  // Mask bits 7:5
-    printf("CANSTAT = 0x%02X\n\r", canstat);
-
-    memset(&tx_frame, 0, sizeof(tx_frame));
-//    tx_frame.can_id = 0x799;
-//    tx_frame.can_dlc = 8;
-//    memcpy(tx_frame.data, "STM32H7-", 8);
-
-//    tx_frame.can_id  = 0x29 | CAN_RTR_FLAG;  // 0x29 = (1 << 5) | 0x09
-//    tx_frame.can_dlc = 0;
-
-    uint8_t node_id = 33;
-    uint32_t state = 8;  // AXIS_STATE_CLOSED_LOOP_CONTROL
-
-    tx_frame.can_id = (node_id << 5) | 0x007;  // 0x007 = Set_Axis_State
-    tx_frame.can_dlc = 4;
-
-    memcpy(&tx_frame.data[0], &state, sizeof(state));
-
-    MCP_sendMessage(&tx_frame);
-
-    osDelay(300);
-
-    tx_frame.can_dlc = 8;
-    float velocity = 1.4f;
-    float torque_ff = 0.0f;  // Optional
-    int16_t torque_ff_pos = 0;           // torque feedforward = 0
-    int16_t vel_ff = 0;              // velocity feedforward = 0
-    float position = 0.0f;          // revolutions
-
-
-    tx_frame.can_id = (node_id << 5) | 0x00D;  // 0x00D = Set_Input_Vel
-    memcpy(&tx_frame.data[0], &velocity, sizeof(float));
-    memcpy(&tx_frame.data[4], &torque_ff, sizeof(float));
-
-//    tx_frame.can_id = (node_id << 5) | 0x00C;  // 0x00C = Set_Input_Pos
-//    memcpy(&tx_frame.data[0], &position, sizeof(float));
-//    memcpy(&tx_frame.data[4], &vel_ff, sizeof(int16_t));
-//    memcpy(&tx_frame.data[6], &torque_ff_pos, sizeof(int16_t));
-
-//    for (int i = 0; i < 8; i++) tx_frame.data[i] = i;
-
-    printf("\nDefault Task Initialized \r\n");
-
-    /* Infinite loop */
-    for (;;)
-    {
-        canstat = MCP_readRegister(MCP_CANSTAT);  // 0x0E
-        mode = canstat & 0xE0;  // Mask bits 7:5
-
-        if (mode == CANCTRL_REQOP_NORMAL) {
-			CAN_Error tx_result = MCP_sendMessage(&tx_frame);
-			printf("TX Result: %d\n\r", tx_result);
-
-			if (MCP_checkReceive()) {
-				if (MCP_readMessage(&rx_frame) == ERROR_OK) {
-					printf("Received: ");
-					printf("CAN ID: 0x%03lX", rx_frame.can_id & CAN_SFF_MASK);
-
-					printf("  DLC: %d  Data:", rx_frame.can_dlc);
-					for (int i = 0; i < rx_frame.can_dlc; i++) {
-					    printf(" %02X", rx_frame.data[i]);
-					}
-					printf("\r\n");
-				}
-			} else {
-				printf("Received Nothing\r\n");
-			}
-        }
-
-        osDelay(100);
+    /* Default task is not instantiated in PEDRO_OMNIBASE (the original PEDRO
+     * MCP2515/ODrive bring-up loop lived here). Body retained as a no-op so
+     * the symbol is still defined for the prototype above. */
+    (void)argument;
+    for (;;) {
+        osDelay(1000);
     }
   /* USER CODE END 5 */
 }
@@ -1477,7 +1513,11 @@ void start_UART_RX_Task(void *argument)
 
 	char line_buf[RX_BUF_SIZE] = {0};
 	uint16_t line_index = 0;
-	InputData data = {0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0f,0.0f,0.0f};
+	/* InputData field order: x_desired, y_desired, phi_end, d, x_off, y_off,
+	 * r, u1..u4_desired. The serial_comm host does not transmit x_off/y_off,
+	 * so they are pre-seeded here to the physical PEDRO base values (matching
+	 * OMNIBASE_CAN_BNO085 constants 0.195 m). sscanf never overwrites these. */
+	InputData data = {0.0, 0.0, 0.0, 0.0, 0.195, 0.195, 0.0762, 0.0f, 0.0f, 0.0f, 0.0f};
 	PIDConfig kpids = {
 		.x_pid = {0.0f, 0.0f, 0.0f},
 		.y_pid = {0.0f, 0.0f, 0.0f},
@@ -1507,6 +1547,14 @@ void start_UART_RX_Task(void *argument)
 //					printf("📥 Full line received: \"%s\"\r\n", line_buf);
 
 					// Optional: parse float data
+					/* 30-float line format — kept identical to the original PEDRO
+					 * format so pedro_ws/omnibase_ws/src/serial_comm/serial_comm/
+					 * serial_communication.py works unchanged:
+					 *   x y phi d r  u1 u2 u3 u4  xKp xKi xKd  yKp yKi yKd
+					 *   phiKp phiKi phiKd  u0Kp u0Ki u0Kd ... u3Kp u3Ki u3Kd
+					 * Note: the host sends `d` (radius offset) in the 4th slot
+					 * but the firmware reuses it as x_off (half-wheelbase X)
+					 * for the mecanum IK — see status.md for the rationale. */
 					if (sscanf(line_buf, "%lf %lf %lf %lf %lf %f %f %f %f %f %f %f %f %f %f %f %f %f %f %f %f %f %f %f %f %f %f %f %f %f",
 					           &data.x_desired, &data.y_desired,
 					           &data.phi_end, &data.d, &data.r,
@@ -1519,13 +1567,15 @@ void start_UART_RX_Task(void *argument)
 							   &kpids.u_pid[2].Kp, &kpids.u_pid[2].Ki, &kpids.u_pid[2].Kd,
 							   &kpids.u_pid[3].Kp, &kpids.u_pid[3].Ki, &kpids.u_pid[3].Kd) == 30)
 					{
+						/* Refresh the watchdog tick before fanning out so the
+						 * ControlTask never sees a SET_VEL it has not yet
+						 * observed. uint32_t store is atomic on Cortex-M7. */
+						g_last_cmd_tick = osKernelGetTickCount();
 
 						osMessageQueuePut(UART2KPIDs_QueueHandle, &kpids, 0, 0);
 						osMessageQueuePut(kpids_UART_TX_QueueHandle, &kpids, 0, 0);
 						osMessageQueuePut(UART_QueueHandle, &data, 0, 0);
 						osMessageQueuePut(UART2CtrlTsk_QueueHandle, &data, 0, 0);
-//						printf("✅ Parsed: x=%.2f y=%.2f phi=%.2f d=%.2f r=%.2f\r\n",
-//							   data.x_desired, data.y_desired, data.phi_end, data.d, data.r);
 					} else {
 						printf("❌ Failed to parse: \"%s\"\r\n", line_buf);
 					}
@@ -1572,8 +1622,8 @@ void start_UART_RX_Task(void *argument)
 void Start_UART_TX_Task(void *argument)
 {
   /* USER CODE BEGIN Start_UART_TX_Task */
-	  InputData data = {0,0,0,1,1};
-	  CtrlTsk_Data CtrlTsk_data;
+	  InputData data = {0.0, 0.0, 0.0, 0.0762, 0.195, 0.195, 0.0762, 0.0f, 0.0f, 0.0f, 0.0f};
+	  CtrlTsk_Data CtrlTsk_data = {0};
 	  IMUData      *imu      = &CtrlTsk_data.imu;
 	  EncoderData  *enc      = &CtrlTsk_data.encoders;
 	  Errors       *err      = &CtrlTsk_data.error;
@@ -1624,13 +1674,23 @@ void Start_UART_TX_Task(void *argument)
   for(;;)
   {
 	osDelay(1);
-	osMessageQueueGet(UART_QueueHandle, &data, NULL, osWaitForever);
-	osMessageQueueGet(kpids_UART_TX_QueueHandle, &kpids, NULL, osWaitForever);
-	osMessageQueueGet(CtrlTsk_QueueHandle, &CtrlTsk_data, NULL, osWaitForever);
-	// ~60 variables sent
+
+	/* Non-blocking reads — keep whatever was last latched if the queue is
+	 * empty. The previous PEDRO version used osWaitForever which deadlocked
+	 * the telemetry task whenever the ControlTask was stalled. */
+	osMessageQueueGet(UART_QueueHandle, &data, NULL, 0);
+	osMessageQueueGet(kpids_UART_TX_QueueHandle, &kpids, NULL, 0);
+	osMessageQueueGet(CtrlTsk_QueueHandle, &CtrlTsk_data, NULL, 0);
+	/* Telemetry line — comma-separated key=value pairs, one line per ~100 Hz.
+	 * The format extends the original PEDRO telemetry with BNO085 quaternion,
+	 * angular velocity, linear acceleration fields and a robot_state byte
+	 * (see RobotState enum in main.h). Field order is documented in status.md. */
 	printf("x_desired=%lf,y_desired=%lf,phi_desired=%lf,d=%lf,r=%lf,"
 			"roll=%lf,pitch=%lf,yaw=%lf,"
-			"TIM1=%d,TIM2=%d,TIM4=%d,TIM8=%d,"
+			"IMU_qx=%.6f,IMU_qy=%.6f,IMU_qz=%.6f,IMU_qw=%.6f,"
+			"IMU_wx=%.6f,IMU_wy=%.6f,IMU_wz=%.6f,"
+			"IMU_ax=%.6f,IMU_ay=%.6f,IMU_az=%.6f,"
+			"TIM1=%u,TIM2=%u,TIM4=%u,TIM8=%u,"
 			"Enc_Wheel_Omega1=%.6f,Enc_Wheel_Omega2=%.6f,Enc_Wheel_Omega3=%.6f,Enc_Wheel_Omega4=%.6f,"
 			"Inertial_ang_vel_calc=%.6f,Inertial_x_vel_calc=%.6f,Inertial_y_vel_calc=%.6f,"
 			"ODOM_phi=%.3f,ODOM_x_pos=%.3f,ODOM_y_pos=%.3f,ODOM_Err_x=%0.3lf,ODOM_Err_y=%0.3lf,ODOM_Err_phi=%0.3lf,"
@@ -1638,6 +1698,7 @@ void Start_UART_TX_Task(void *argument)
 			"Ctrl_Inertial_x_dot=%.3f,Ctrl_Inertial_y_dot=%.3f,Ctrl_Inertial_phi_dot=%.3f,Ctrl_necc_u1=%.3f,Ctrl_necc_u2=%.3f,Ctrl_necc_u3=%.3f,Ctrl_necc_u4=%.3f,"
 			"ts_current=%lu,ts_previous=%lu,ts_delta=%lu,"
 			"Ctrl_duty_u1=%u,Ctrl_duty_u2=%u,Ctrl_duty_u3=%u,Ctrl_duty_u4=%u,"
+			"robot_state=%u,"
 			"xKp=%.3f,xKi=%.3f,xKd=%.3f,"
 			"yKp=%.3f,yKi=%.3f,yKd=%.3f,"
 			"phiKp=%.3f,phiKi=%.3f,phiKd=%.3f,"
@@ -1647,6 +1708,9 @@ void Start_UART_TX_Task(void *argument)
 			"u3Kp=%.3f,u3Ki=%.3f,u3Kd=%.3f\r\n",
 			data.x_desired, data.y_desired, data.phi_end, data.d, data.r,
 			imu->roll, imu->pitch, imu->yaw,
+			imu->qx, imu->qy, imu->qz, imu->qw,
+			imu->wx, imu->wy, imu->wz,
+			imu->ax, imu->ay, imu->az,
 			enc->cnt_vals[0], enc->cnt_vals[1], enc->cnt_vals[2], enc->cnt_vals[3],
 			enc->omegaVals[0], enc->omegaVals[1], enc->omegaVals[2], enc->omegaVals[3],
 			odom->q_dot[0],odom->q_dot[1],odom->q_dot[2], odom->phi,odom->x_pos,odom->y_pos, err->err_x,
@@ -1655,6 +1719,7 @@ void Start_UART_TX_Task(void *argument)
 			ctrl_out->x_dot, ctrl_out->y_dot, ctrl_out->phi_dot, ctrl_out->u[0], ctrl_out->u[1], ctrl_out->u[2], ctrl_out->u[3],
 			ts->current, ts->print_prev, ts->delta,
 			ctrl_out->dutyCycles[0], ctrl_out->dutyCycles[1], ctrl_out->dutyCycles[2], ctrl_out->dutyCycles[3],
+			(unsigned)CtrlTsk_data.robot_state,
 			xPID_K->Kp, xPID_K->Ki, xPID_K->Kd,
 			yPID_K->Kp, yPID_K->Ki, yPID_K->Kd,
 			phiPID_K->Kp, phiPID_K->Ki, phiPID_K->Kd,
@@ -1706,332 +1771,446 @@ void Start_UART_TX_Task(void *argument)
 void StartControlTask(void *argument)
 {
   /* USER CODE BEGIN StartControlTask */
-  uint8_t usingIMU = 0;
+  /* ------------------------------------------------------------------
+   *  Constants — physical / encoder calibration
+   * ------------------------------------------------------------------ */
+  const float PI_F          = 3.141592f;
+  const float R_counts      = 424.0f;          /* counts/rev × 4 quadrature, small motors */
+  const float Rads_per_count = 2.0f * PI_F / R_counts;
+  const float Degs_per_count = 360.0f / R_counts;
 
-  if (usingIMU) {
-	  bno055_assignI2C(&hi2c1);
-	  bno055_setup();
-	  bno055_setOperationModeNDOF();
-  }
+  /* Mecanum frame constants — must match OMNIBASE_CAN_BNO085 main.c:2077-2081
+   * (x_offset, y_offset, radius, wheel_sign). Per-motor sign comes from
+   * g_wheel_sign[] in the file-scope globals. */
+  const double x_off  = 0.195;   /* m, half wheelbase X */
+  const double y_off  = 0.195;   /* m, half wheelbase Y */
+  const double radius = 0.0762;  /* m, wheel radius */
 
+  /* PWM saturation — TIM5/12/14/15 are ARR=19999 (1 MHz tick × 50 Hz), so the
+   * compare register is duty in 1 µs units out of 20 ms. */
+  const int16_t deadzone_duty_lim = 1000;
+  const int16_t max_duty_cycle    = 19999;
+  const double max_integral_action_val = 1.0e15;
+
+  /* ------------------------------------------------------------------
+   *  Local state
+   * ------------------------------------------------------------------ */
   int16_t deltaEncCounts[4] = {0,0,0,0};
-
-  float PI = 3.141592;
-
-
-//  const float R_counts = 17380.0; // MOTORES GRANDES
-  const float R_counts = 424.0; // MOTORES CHICOS
-  const float Degs_per_count = 360.0 / R_counts;
-  const float Rads_per_count = 2*PI / R_counts;
-
-  double u_err_trshld = 0.1;
-
-//  float PID_K_oneM[3] = {0.5,0.003,0.0};
-//  float xPID_K[3] = {0.5,0.003,0.0};
-//  float yPID_K[3] = {0.5,0.003,0.0};
-//  float phiPID_K[3] = {0.5,0.003,0.0};
-//  float uPID_K[4][3] = {{1,0,0},{1,0,0},{1,0,0},{0,0,0}};
-
-//  for (int i = 0; i < 4; i++) {
-//	  for (int j = 0; j < 3; j++) {
-//		  uPID_K[i][j] = PID_K_oneM[j];
-//	  }
-//  }
-
-  float xTrshld = 0.01; // Allowed error cm
-  float yTrshld = 0.01; // Allowed error cm
-  float phiTrshld = 0.01; // Allowed error radians
-
-  double sumKI_x = 0;
-  double sumKI_y = 0;
-  double sumKI_phi = 0;
-  double sumKI_u_errs[4] = {0,0,0,0};
-
+  double sumKI_u_errs[4]   = {0,0,0,0};
   double dt = 0;
 
-  bno055_vector_t BNO055_EulerVector = {0.0,0.0,0.0,0.0};
-  if (usingIMU){
-	  BNO055_EulerVector = bno055_getVectorEuler();
-  }
+  /* Default input — the host typically streams these at 10 Hz; values are
+   * retained between cycles when no fresh queue entry is available. Field
+   * order matches main.h InputData: {x_desired, y_desired, phi_end, d,
+   * x_off, y_off, r, u1..u4_desired}. */
+  InputData    data         = {0.0, 0.0, 0.0, 0.0762, 0.195, 0.195, 0.0762,
+                               0.0f, 0.0f, 0.0f, 0.0f};
+  CtrlTsk_Data CtrlTsk_data = {0};
+  IMUData      *imu         = &CtrlTsk_data.imu;
+  EncoderData  *enc         = &CtrlTsk_data.encoders;
+  Errors       *err         = &CtrlTsk_data.error;
+  TimeState    *ts          = &CtrlTsk_data.time;
+  OdomData     *odom        = &CtrlTsk_data.odom;
+  CtrlOutData  *ctrl_out    = &CtrlTsk_data.ctrl;
 
-  int16_t deadzone_duty_lim = 1000;
-  int16_t max_duty_cycle = 19999;
+  PIDConfig kpids = {0};
+  PIDGains *uPID_K = kpids.u_pid;
 
-  InputData data = {0,0,0,1,1,0,0,0,0};
-  CtrlTsk_Data CtrlTsk_data;
-  IMUData      *imu      = &CtrlTsk_data.imu;
-  EncoderData  *enc      = &CtrlTsk_data.encoders;
-  Errors       *err      = &CtrlTsk_data.error;
-  TimeState    *ts       = &CtrlTsk_data.time;
-  OdomData     *odom     = &CtrlTsk_data.odom;
-  CtrlOutData  *ctrl_out = &CtrlTsk_data.ctrl;
+  /* Robot-level state machine — see RobotState enum in main.h.
+   * IDLE on boot; first command transitions to RUNNING. */
+  RobotState state            = ROBOT_STATE_IDLE;
+  uint8_t    watchdog_fired   = 0;
 
-  PIDConfig kpids = {
-	.x_pid = {0.0f, 0.0f, 0.0f},
-	.y_pid = {0.0f, 0.0f, 0.0f},
-	.phi_pid = {0.0f, 0.0f, 0.0f},
-	.u_pid = {
-		{0.0f, 0.0f, 0.0f},
-		{0.0f, 0.0f, 0.0f},
-		{0.0f, 0.0f, 0.0f},
-		{0.0f, 0.0f, 0.0f}
-	}
-  };
+  /* Initialise tick timestamps so the very first loop iteration has a
+   * meaningful delta and the watchdog is disarmed until the first command. */
+  ts->previous   = osKernelGetTickCount();
+  ts->current    = ts->previous;
+  ts->delta      = 1;
+  ts->print_prev = ts->previous;
+  g_last_cmd_tick = ts->previous;
 
-  PIDGains *xPID_K   = &kpids.x_pid;
-  PIDGains *yPID_K   = &kpids.y_pid;
-  PIDGains *phiPID_K = &kpids.phi_pid;
-  PIDGains *uPID_K   = kpids.u_pid;
+  /* Force-zero the H-bridge IN pins so motors don't twitch before the first
+   * scheduling pass. */
+  __HAL_TIM_SET_COMPARE(&htim5 , TIM_CHANNEL_1, 0);
+  __HAL_TIM_SET_COMPARE(&htim12, TIM_CHANNEL_1, 0);
+  __HAL_TIM_SET_COMPARE(&htim14, TIM_CHANNEL_1, 0);
+  __HAL_TIM_SET_COMPARE(&htim15, TIM_CHANNEL_1, 0);
+  setMotorDirection(GPIOD, 4, 5, 2);  /* brake = both LOW */
+  setMotorDirection(GPIOD, 6, 7, 2);
+  setMotorDirection(GPIOE, 2, 4, 2);
+  setMotorDirection(GPIOE, 3, 6, 2);
 
-  imu->yaw = 0.0;  imu->roll = 0.0;  imu->pitch = 0.0;
-
-  for (int i = 0; i < 4; i++) {
-      enc->cnt_vals[i] = 0;  enc->prevcnt_vals[i] = 0;  enc->angleVals[i] = 0.0f;  enc->omegaVals[i] = 0.0;
-  }
-
-  err->err_x = 0.0;  err->err_y = 0.0;  err->err_phi = 0.0;
-  for (int i = 0; i < 4; i++) {
-	  err->u_errs[i] = 0.0;
-  }
-  ts->current = 1;  ts->previous = 0;  ts->delta = osKernelGetTickCount();  ts->print_prev = 1;
-
-  odom->x_pos = 0.0;  odom->y_pos = 0.0;  odom->phi = 0.0; odom->q_dot[0] = 0; odom->q_dot[1] = 0; odom->q_dot[2] = 0;
-
-  ctrl_out->x_dot = 4.0;  ctrl_out->y_dot = 6.0;  ctrl_out->phi_dot = 0.0;
-
-  for (int i = 0; i < 4; i++) {
-      ctrl_out->PWM_vals[i] = 0.0;  ctrl_out->dutyCycles[i] = 0;  ctrl_out->M_dirs[i] = 0;  ctrl_out->u[i] = 0.0;
-  }
-
-  osStatus_t queue_status;
-
-  bool simulation_on = false;
-
-  bool velocity_ctrl_mode = true;
-
-  double max_integral_action_val = 999999999999999;
+  /* Seed encoder previous-counts so the first delta is zero. */
+  enc->prevcnt_vals[0] = (uint16_t)TIM1->CNT;
+  enc->prevcnt_vals[1] = (uint16_t)TIM2->CNT;
+  enc->prevcnt_vals[2] = (uint16_t)TIM4->CNT;
+  enc->prevcnt_vals[3] = (uint16_t)TIM8->CNT;
 
   /* Infinite loop */
   for(;;)
   {
+    osDelay(10);    /* 100 Hz control loop */
+    uint32_t now = osKernelGetTickCount();
 
-    osDelay(10);
+    /* ------------------------------------------------------------------
+     *  1. Sense — encoder counters, IMU globals, tick delta
+     * ------------------------------------------------------------------ */
+    enc->cnt_vals[0] = (uint16_t)TIM1->CNT;
+    enc->cnt_vals[1] = (uint16_t)TIM2->CNT;
+    enc->cnt_vals[2] = (uint16_t)TIM4->CNT;
+    enc->cnt_vals[3] = (uint16_t)TIM8->CNT;
 
-/*------------------------------------------------------------------------*/
-/******* 1. Get angular position and velocity with encoders & IMU *********/
-    if (!simulation_on) {
-		enc->cnt_vals[0] = TIM1->CNT; enc->cnt_vals[1] = TIM2->CNT; enc->cnt_vals[2] = TIM4->CNT; enc->cnt_vals[3] = TIM8->CNT;
-
-		if (usingIMU) {
-			BNO055_EulerVector = bno055_getVectorEuler();
-			imu->yaw = BNO055_EulerVector.x;  imu->roll = BNO055_EulerVector.y;  imu->pitch = BNO055_EulerVector.z;
-		}
-
-		// Calculate counter difference, considering wrap-around
-		deltaEncCounts[0] = computeDeltaCNT(enc->cnt_vals[0], enc->prevcnt_vals[0]);
-		deltaEncCounts[1] = computeDeltaCNT(enc->cnt_vals[1], enc->prevcnt_vals[1]);
-		deltaEncCounts[2] = computeDeltaCNT(enc->cnt_vals[2], enc->prevcnt_vals[2]);
-		deltaEncCounts[3] = computeDeltaCNT(enc->cnt_vals[3], enc->prevcnt_vals[3]);
-	//	printf("TIM1: %d TIM2: %d TIM4: %d TIM8: %d \r\n", CNT_Vals[0],CNT_Vals[1],CNT_Vals[2],CNT_Vals[3]);
-		enc->prevcnt_vals[0] = enc->cnt_vals[0]; enc->prevcnt_vals[1] = enc->cnt_vals[1]; enc->prevcnt_vals[2] = enc->cnt_vals[2]; enc->prevcnt_vals[3] = enc->cnt_vals[3];
-
-		// Update total angle value
-		enc->angleVals[0] += deltaEncCounts[0] * Degs_per_count;
-		enc->angleVals[1] += deltaEncCounts[1] * Degs_per_count;
-		enc->angleVals[2] += deltaEncCounts[2] * Degs_per_count;
-		enc->angleVals[3] += deltaEncCounts[3] * Degs_per_count;
-
-		// Calculate velocities
-		ts->print_prev = ts->previous;
-		ts->current = osKernelGetTickCount();
-		ts->delta = ts->current - ts->previous;
-		ts->previous = ts->current;
-		//	printf(" currentTime: %lu prevTime: %lu deltaTime: %lu", currentTime, prevTime, deltaTime);
-
-		enc->omegaVals[0] = deltaEncCounts[0] * Rads_per_count /  (ts->delta / 1000.0f) / (2*PI);
-		enc->omegaVals[1] = deltaEncCounts[1] * Rads_per_count /  (ts->delta / 1000.0f) / (2*PI);
-		enc->omegaVals[2] = deltaEncCounts[2] * Rads_per_count /  (ts->delta / 1000.0f) / (2*PI);
-		enc->omegaVals[3] = deltaEncCounts[3] * Rads_per_count /  (ts->delta / 1000.0f) / (2*PI);
-    } else {
-		BNO055_EulerVector = bno055_getVectorEuler();
-		imu->yaw = BNO055_EulerVector.x;  imu->roll = BNO055_EulerVector.y;  imu->pitch = BNO055_EulerVector.z;
-
-    	ts->print_prev = ts->previous;
-		ts->current = osKernelGetTickCount();
-		ts->delta = ts->current - ts->previous;
-		ts->previous = ts->current;
-
-		// Simple first-order simulation model: omega approaches u with time
-		float tau = 0.1f;  // time constant for motor response
-		float alpha = ts->delta / (1000.0f * tau + ts->delta);  // convert delta to seconds
-
-    	for (int i = 0; i < 4; i++) {
-    	    enc->omegaVals[i] = (1 - alpha) * enc->omegaVals[i] + alpha * ctrl_out->u[i];
-
-    	    // Update total angle by integrating omega
-    	    float dt = ts->delta / 1000.0f;  // ms to s
-    	    enc->angleVals[i] += enc->omegaVals[i] * dt;
-
-    	    // Simulate counts from angle
-    	    enc->cnt_vals[i] = (uint16_t)(enc->angleVals[i] / Degs_per_count) % 65536;
-    	    deltaEncCounts[i] = computeDeltaCNT(enc->cnt_vals[i], enc->prevcnt_vals[i]);
-    	    enc->prevcnt_vals[i] = enc->cnt_vals[i];
-    	}
+    deltaEncCounts[0] = computeDeltaCNT(enc->cnt_vals[0], enc->prevcnt_vals[0]);
+    deltaEncCounts[1] = computeDeltaCNT(enc->cnt_vals[1], enc->prevcnt_vals[1]);
+    deltaEncCounts[2] = computeDeltaCNT(enc->cnt_vals[2], enc->prevcnt_vals[2]);
+    deltaEncCounts[3] = computeDeltaCNT(enc->cnt_vals[3], enc->prevcnt_vals[3]);
+    for (int i = 0; i < 4; i++) {
+        enc->prevcnt_vals[i] = enc->cnt_vals[i];
+        enc->angleVals[i]   += deltaEncCounts[i] * Degs_per_count;
     }
-/***************************************************************************/
-/*------------------------------------------------------------------------*/
 
+    ts->print_prev = ts->previous;
+    ts->current    = now;
+    ts->delta      = (ts->current > ts->previous) ? (ts->current - ts->previous) : 1;
+    ts->previous   = ts->current;
+    const float dt_s = (float)ts->delta / 1000.0f;
 
-/*------------------------------------------------------------------------*/
-/**************** 2. Receive desired pose/pidKs from UART *****************/
+    /* Wheel angular velocity (rev/s — matches the original PEDRO units). */
+    for (int i = 0; i < 4; i++) {
+        enc->omegaVals[i] = (double)deltaEncCounts[i] * Rads_per_count / dt_s / (2.0 * PI_F);
+    }
 
-	osMessageQueueGet(UART2CtrlTsk_QueueHandle, &data, NULL, osWaitForever);
-	osMessageQueueGet(UART2KPIDs_QueueHandle, &kpids, NULL, osWaitForever);
+    /* IMU globals (written by StartIMUTask via the SH2 callback). 32-bit
+     * float reads are atomic on Cortex-M7, so no mutex is needed. */
+    imu->yaw   = (double)g_bno085_yaw;
+    imu->pitch = (double)g_bno085_pitch;
+    imu->roll  = (double)g_bno085_roll;
+    imu->qx = g_bno085_qx;
+    imu->qy = g_bno085_qy;
+    imu->qz = g_bno085_qz;
+    imu->qw = g_bno085_qw;
+    imu->wx = g_bno085_wx;
+    imu->wy = g_bno085_wy;
+    imu->wz = g_bno085_wz;
+    imu->ax = g_bno085_ax;
+    imu->ay = g_bno085_ay;
+    imu->az = g_bno085_az;
 
-/**************************************************************************/
-/*------------------------------------------------------------------------*/
+    /* ------------------------------------------------------------------
+     *  2. Read freshly-parsed command / gains (non-blocking)
+     * ------------------------------------------------------------------ */
+    InputData new_cmd;
+    if (osMessageQueueGet(UART2CtrlTsk_QueueHandle, &new_cmd, NULL, 0) == osOK) {
+        data = new_cmd;
+        watchdog_fired = 0;
 
+        /* Sentinel ESTOP: host sets x_desired = ESTOP_CMD_KEY (-9999.0).
+         * Once latched, ESTOP cannot be cleared by a normal command — the
+         * MCU must be reset. */
+        if (data.x_desired == ESTOP_CMD_KEY) {
+            state = ROBOT_STATE_ESTOP;
+        } else if (state == ROBOT_STATE_IDLE || state == ROBOT_STATE_STOP) {
+            state = ROBOT_STATE_RUNNING;
+        }
+    }
+    osMessageQueueGet(UART2KPIDs_QueueHandle, &kpids, NULL, 0);
 
-/*------------------------------------------------------------------------*/
-/************************** 3. Compute errors *****************************/
-	err->err_x = data.x_desired - odom->x_pos;
-	err->err_y = data.y_desired - odom->y_pos;
-	//phi_desired = atan2(Err_y, Err_x); /*<-- Unnecessary? ony for diff drive?*/
+    /* ------------------------------------------------------------------
+     *  3. Watchdog — drop to STOP if no fresh command for > timeout
+     * ------------------------------------------------------------------ */
+    if (state == ROBOT_STATE_RUNNING &&
+        !watchdog_fired &&
+        (now - g_last_cmd_tick) >= CMD_WATCHDOG_TIMEOUT_MS) {
+        state          = ROBOT_STATE_STOP;
+        watchdog_fired = 1;
+    }
 
-	/* POTENTIALLY READ IMU HERE (TO UPDATE PHI)*/
-	err->err_phi = data.phi_end - odom->phi;
-//	printf("Err_x: %0.3lf  Err_y: %0.3lf  Err_phi: %0.3lf \n", Err_x, Err_y, Err_phi);
-/**************************************************************************/
-/*------------------------------------------------------------------------*/
+    /* ------------------------------------------------------------------
+     *  4. State-machine — compute desired wheel speeds u[i]
+     * ------------------------------------------------------------------ */
+    switch (state) {
+        case ROBOT_STATE_RUNNING:
+            /* Velocity mode (matches OMNIBASE Type-1 semantics): host sends
+             * commanded wheel angular velocities directly in u1..u4 slots.
+             * Body-frame x/y/phi is computed via the IK below ONLY when the
+             * host omits the per-wheel setpoints (all zero). For a pure
+             * twist-input host, pass x_desired=vx, y_desired=vy, phi_end=wz
+             * and zero u1..u4 — the IK will fill u[] using the mecanum
+             * convention with the corrected signs from OMNIBASE. */
+            if (data.u1_desired == 0.0f && data.u2_desired == 0.0f &&
+                data.u3_desired == 0.0f && data.u4_desired == 0.0f &&
+                (data.x_desired != 0.0 || data.y_desired != 0.0 || data.phi_end != 0.0)) {
+                /* Twist mode: x_desired = vx (m/s), y_desired = vy (m/s),
+                 * phi_end = wz (rad/s). IK uses phi=0 (heading-aligned drive),
+                 * matching OMNIBASE main.c:1677. */
+                computeNecessaryWheelSpeedsMecanum(0.0, x_off, y_off, radius,
+                                                   ctrl_out->u,
+                                                   data.phi_end,    /* phi_dot */
+                                                   data.y_desired,  /* y_dot   */
+                                                   data.x_desired); /* x_dot   */
+            } else {
+                /* Per-wheel velocity passthrough — original PEDRO behaviour. */
+                ctrl_out->u[0] = data.u1_desired;
+                ctrl_out->u[1] = data.u2_desired;
+                ctrl_out->u[2] = data.u3_desired;
+                ctrl_out->u[3] = data.u4_desired;
+            }
+            ctrl_out->x_dot   = data.x_desired;
+            ctrl_out->y_dot   = data.y_desired;
+            ctrl_out->phi_dot = data.phi_end;
+            break;
 
-/*------------------------------------------------------------------------*/
-/***************************** 4. POSE PIDs *******************************/
-	if (!velocity_ctrl_mode) {
+        case ROBOT_STATE_IDLE:
+        case ROBOT_STATE_STOP:
+        case ROBOT_STATE_ESTOP:
+        default:
+            /* All "not driving" states share the same actuator command:
+             * zero everything, reset the integral accumulators, brake DIR. */
+            for (int i = 0; i < 4; i++) {
+                ctrl_out->u[i]    = 0.0;
+                sumKI_u_errs[i]   = 0.0;
+            }
+            ctrl_out->x_dot   = 0.0;
+            ctrl_out->y_dot   = 0.0;
+            ctrl_out->phi_dot = 0.0;
+            break;
+    }
 
-		if (abs(err->err_x) > xTrshld){
-			sumKI_x += err->err_x * ts->delta;
-			ctrl_out->x_dot = xPID_K->Kp*err->err_x + xPID_K->Ki*sumKI_x + xPID_K->Kd * (err->err_x / ts->delta);
-			ctrl_out->phi_dot = 0;
-		}
+    /* ------------------------------------------------------------------
+     *  5. Per-wheel PID  →  signed PWM, then split into duty + direction
+     * ------------------------------------------------------------------ */
+    for (int i = 0; i < 4; i++) {
+        /* Apply wheel sign on the *commanded* side so the encoder-measured
+         * omega (which is raw, motor-frame) compares apples-to-apples. */
+        const double u_motor = g_wheel_sign[i] * ctrl_out->u[i];
 
-		if (abs(err->err_y) > yTrshld){
-			sumKI_y += err->err_y * ts->delta;
-			ctrl_out->y_dot = yPID_K->Kp*err->err_y + yPID_K->Ki*sumKI_y + yPID_K->Kd * (err->err_y / ts->delta);
-			ctrl_out->phi_dot = 0;
-		}
+        err->u_errs[i]    = u_motor - enc->omegaVals[i];
+        sumKI_u_errs[i]  += err->u_errs[i] * (double)ts->delta;
+        if (sumKI_u_errs[i] >  max_integral_action_val) sumKI_u_errs[i] =  max_integral_action_val;
+        if (sumKI_u_errs[i] < -max_integral_action_val) sumKI_u_errs[i] = -max_integral_action_val;
 
-		if (abs(err->err_x) <= xTrshld && abs(err->err_y) <= yTrshld) {
-			ctrl_out->x_dot = 0;
-			ctrl_out->y_dot = 0;
+        ctrl_out->PWM_vals[i] = uPID_K[i].Kp * err->u_errs[i]
+                              + uPID_K[i].Ki * sumKI_u_errs[i]
+                              + uPID_K[i].Kd * (err->u_errs[i] / (double)ts->delta);
 
-			if (abs(err->err_phi) > phiTrshld){
-				sumKI_phi += err->err_phi * ts->delta;
-				ctrl_out->phi_dot = phiPID_K->Kp*err->err_phi + phiPID_K->Ki*sumKI_phi + phiPID_K->Kd * (err->err_phi / ts->delta);
-			}
-		}
+        if (state != ROBOT_STATE_RUNNING) {
+            ctrl_out->PWM_vals[i] = 0;
+        }
 
-		if (abs(err->err_x) <= xTrshld && abs(err->err_y) <= yTrshld && abs(err->err_phi) <= phiTrshld){
+        if (ctrl_out->PWM_vals[i] < 0) {
+            ctrl_out->M_dirs[i] = 1;
+            if (ctrl_out->PWM_vals[i] > -deadzone_duty_lim) ctrl_out->PWM_vals[i] = -deadzone_duty_lim;
+            else if (ctrl_out->PWM_vals[i] < -max_duty_cycle) ctrl_out->PWM_vals[i] = -max_duty_cycle;
+            ctrl_out->dutyCycles[i] = (uint16_t)(-ctrl_out->PWM_vals[i]);
+        } else if (ctrl_out->PWM_vals[i] > 0) {
+            ctrl_out->M_dirs[i] = 0;
+            if (ctrl_out->PWM_vals[i] <  deadzone_duty_lim) ctrl_out->PWM_vals[i] =  deadzone_duty_lim;
+            else if (ctrl_out->PWM_vals[i] >  max_duty_cycle) ctrl_out->PWM_vals[i] =  max_duty_cycle;
+            ctrl_out->dutyCycles[i] = (uint16_t)(ctrl_out->PWM_vals[i]);
+        } else {
+            /* Exact zero — leave duty at 0 so motors stop, but pick a
+             * direction (0) so the H-bridge is in a defined state. */
+            ctrl_out->M_dirs[i]     = 2;   /* brake */
+            ctrl_out->dutyCycles[i] = 0;
+        }
+    }
 
-			ctrl_out->x_dot = 0;
-			ctrl_out->y_dot = 0;
-			ctrl_out->phi_dot = 0;
-			sumKI_x = 0; sumKI_y = 0; sumKI_phi = 0;
-		}
+    /* ------------------------------------------------------------------
+     *  6. Apply outputs — to real motors, or to debug LEDs
+     * ------------------------------------------------------------------ */
+#if DEBUG_LEDS
+    /* Debug routing: physical H-bridge DIR pins held in brake (both LOW)
+     * and PWM compare set to 0 so the motors never spin even with power on.
+     * Nucleo on-board LEDs mirror "motor commanded above threshold":
+     *   LD1 ← M0 or M2 active
+     *   LD2 ← M1 or M3 active
+     * LD3 (PB14) is intentionally skipped because PB14 is the TIM12_CH1
+     * pin used by M1 PWM. */
+    setMotorDirection(GPIOD, 4, 5, 2);
+    setMotorDirection(GPIOD, 6, 7, 2);
+    setMotorDirection(GPIOE, 2, 4, 2);
+    setMotorDirection(GPIOE, 3, 6, 2);
+    __HAL_TIM_SET_COMPARE(&htim5 , TIM_CHANNEL_1, 0);
+    __HAL_TIM_SET_COMPARE(&htim12, TIM_CHANNEL_1, 0);
+    __HAL_TIM_SET_COMPARE(&htim14, TIM_CHANNEL_1, 0);
+    __HAL_TIM_SET_COMPARE(&htim15, TIM_CHANNEL_1, 0);
 
-	//	printf("Calling computeWheelSpeeds(phi=%.2f, d=%.2f, r=%.2f, phi_dot=%.2f, y_dot=%.2f, x_dot=%.2f)\r\n",
-	//	       0.0, 1.0, 1.0, 0.0, 3.0, 6.0);
+    const uint16_t led_thr = (uint16_t)(deadzone_duty_lim * 2);
+    const GPIO_PinState ld1 = ((ctrl_out->dutyCycles[0] > led_thr) ||
+                               (ctrl_out->dutyCycles[2] > led_thr))
+                              ? GPIO_PIN_SET : GPIO_PIN_RESET;
+    const GPIO_PinState ld2 = ((ctrl_out->dutyCycles[1] > led_thr) ||
+                               (ctrl_out->dutyCycles[3] > led_thr))
+                              ? GPIO_PIN_SET : GPIO_PIN_RESET;
+    HAL_GPIO_WritePin(LD1_GPIO_Port, LD1_Pin, ld1);
+    HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, ld2);
+#else
+    /* Production routing — drive the real H-bridges. */
+    setMotorDirection(GPIOD, 4, 5, ctrl_out->M_dirs[0]);
+    setMotorDirection(GPIOD, 6, 7, ctrl_out->M_dirs[1]);
+    setMotorDirection(GPIOE, 2, 4, ctrl_out->M_dirs[2]);
+    setMotorDirection(GPIOE, 3, 6, ctrl_out->M_dirs[3]);
+    __HAL_TIM_SET_COMPARE(&htim5 , TIM_CHANNEL_1, ctrl_out->dutyCycles[0]);
+    __HAL_TIM_SET_COMPARE(&htim12, TIM_CHANNEL_1, ctrl_out->dutyCycles[1]);
+    __HAL_TIM_SET_COMPARE(&htim14, TIM_CHANNEL_1, ctrl_out->dutyCycles[2]);
+    __HAL_TIM_SET_COMPARE(&htim15, TIM_CHANNEL_1, ctrl_out->dutyCycles[3]);
+#endif
 
-	//	computeNecessaryWheelSpeeds(0.0, data.d, data.r, ctrl_out->u, 0.0, 3.0, 6.0);
-		computeNecessaryWheelSpeedsOmni(odom->phi, data.d, data.r, ctrl_out->u, ctrl_out->phi_dot, ctrl_out->y_dot, ctrl_out->x_dot);
+    /* ------------------------------------------------------------------
+     *  7. Odometry — corrected mecanum FK, apply wheel_sign to measured ω
+     * ------------------------------------------------------------------ */
+    double u_meas[4];
+    for (int i = 0; i < 4; i++) {
+        /* wheel_sign[i] undoes the convention applied at IK time so FK
+         * round-trips. Units: rev/s (PEDRO encoder convention). */
+        u_meas[i] = g_wheel_sign[i] * enc->omegaVals[i];
+    }
+    globalSpeedsFromUMecanum(odom->phi, x_off, y_off, radius, u_meas, odom->q_dot);
+    dt = dt_s;
+    odom->phi   += odom->q_dot[0] * dt;
+    odom->x_pos += odom->q_dot[1] * dt;
+    odom->y_pos += odom->q_dot[2] * dt;
+    /* Wrap φ ∈ (−π, π] — OMNIBASE deliberately leaves this unwrapped, but
+     * the original PEDRO firmware wrapped, and the host's serial_comm node
+     * expects a wrapped angle, so the wrap stays. */
+    if      (odom->phi >  PI_F) odom->phi -= 2.0 * PI_F;
+    else if (odom->phi < -PI_F) odom->phi += 2.0 * PI_F;
 
-	}
-	else {
-		ctrl_out->u[0] = data.u1_desired;
-		ctrl_out->u[1] = data.u2_desired;
-		ctrl_out->u[2] = data.u3_desired;
-		ctrl_out->u[3] = data.u4_desired;
-	}
+    /* ------------------------------------------------------------------
+     *  8. Tracking errors (only meaningful in RUNNING — others read 0)
+     * ------------------------------------------------------------------ */
+    err->err_x   = data.x_desired - odom->x_pos;
+    err->err_y   = data.y_desired - odom->y_pos;
+    err->err_phi = data.phi_end   - odom->phi;
 
-/**************************************************************************/
-/*------------------------------------------------------------------------*/
-
-/*------------------------------------------------------------------------*/
-/***************************** 6. MOTOR PIDs *******************************/
-
-	for (int i = 0; i < 4; i++) {
-
-		err->u_errs[i] = ctrl_out->u[i] - enc->omegaVals[i];
-		sumKI_u_errs[i] += err->u_errs[i] * ts->delta;
-		if (sumKI_u_errs[i] > max_integral_action_val) sumKI_u_errs[i] = max_integral_action_val;
-		if (sumKI_u_errs[i] < -max_integral_action_val) sumKI_u_errs[i] = -max_integral_action_val;
-
-		ctrl_out->PWM_vals[i] = uPID_K[i].Kp*err->u_errs[i] + uPID_K[i].Ki*sumKI_u_errs[i] + uPID_K[i].Kd * (err->u_errs[i] / ts->delta);
-
-//		if (abs(err->u_errs[i]) < u_err_trshld){
-//			sumKI_u_errs[i] = 0; // Reset Integral part if error small
-//		}
-
-		if (ctrl_out->PWM_vals[i] < 0){
-			ctrl_out->M_dirs[i] = 1;
-			if (ctrl_out->PWM_vals[i] < 0 && ctrl_out->PWM_vals[i] > - deadzone_duty_lim) ctrl_out->PWM_vals[i] = -deadzone_duty_lim;
-			else if (ctrl_out->PWM_vals[i] < -max_duty_cycle) ctrl_out->PWM_vals[i] = -max_duty_cycle;
-			ctrl_out->dutyCycles[i] = (uint16_t)(ctrl_out->PWM_vals[i]*-1);
-		}
-		else if (ctrl_out->PWM_vals[i] >= 0){
-			ctrl_out->M_dirs[i] = 0;
-			if (ctrl_out->PWM_vals[i] > 0 && ctrl_out->PWM_vals[i] < deadzone_duty_lim) ctrl_out->PWM_vals[i] = deadzone_duty_lim;
-			else if (ctrl_out->PWM_vals[i] > max_duty_cycle) ctrl_out->PWM_vals[i] = max_duty_cycle;
-			ctrl_out->dutyCycles[i] = (uint16_t)(ctrl_out->PWM_vals[i]);
-		}
-	}
-
-	setMotorDirection(GPIOD, 4, 5, ctrl_out->M_dirs[0]);
-	setMotorDirection(GPIOD, 6, 7, ctrl_out->M_dirs[1]);
-	setMotorDirection(GPIOE, 2, 4, ctrl_out->M_dirs[2]);
-	setMotorDirection(GPIOE, 3, 6, ctrl_out->M_dirs[3]);
-
-	__HAL_TIM_SET_COMPARE(&htim5 , TIM_CHANNEL_1, ctrl_out->dutyCycles[0]);  // Set duty cycle
-	__HAL_TIM_SET_COMPARE(&htim12, TIM_CHANNEL_1, ctrl_out->dutyCycles[1]);  // Set duty cycle
-	__HAL_TIM_SET_COMPARE(&htim14, TIM_CHANNEL_1, ctrl_out->dutyCycles[2]);  // Set duty cycle
-	__HAL_TIM_SET_COMPARE(&htim15, TIM_CHANNEL_1, ctrl_out->dutyCycles[3]);  // Set duty cycle
-
-/**************************************************************************/
-/*------------------------------------------------------------------------*/
-
-
-/*------------------------------------------------------------------------*/
-/***************************** 7. ODOMETRY ********************************/
-
-	globalSpeedsFromUOmni(odom->phi, data.d, data.r, enc->omegaVals, odom->q_dot); // q_dot = {phi_dot, x_dot, y_dot}
-//	globalSpeedsFromU(odom->phi, data.d, data.r, ctrl_out->u, odom->q_dot); // q_dot = {phi_dot, x_dot, y_dot}
-	dt = ts->delta / 1000.0f;  // Convert ms to seconds
-
-	odom->phi    += odom->q_dot[0] * dt;         // Integrated angular velocity
-	odom->x_pos  += odom->q_dot[1] * dt;         // Integrated x velocity (global)
-	odom->y_pos  += odom->q_dot[2] * dt;         // Integrated y velocity (global)
-
-	odom->phi = (odom->phi > PI) ? (odom->phi - 2 * PI) : (odom->phi < -PI) ? (odom->phi + 2 * PI) : odom->phi; // 0 <= phi < 2PI
-
-	/*ADD FIRST ORDER FILTER?*/
-//	q_dot_filtered[i] = alpha * q_dot[i] + (1 - alpha) * q_dot_filtered[i]; // for i = 0 to 2
-
-/**************************************************************************/
-/*------------------------------------------------------------------------*/
-
-/*------------------------------------------------------------------------*/
-/************************ 8. SEND RELEVANT DATA ***************************/
-
-//
-//	printf(" currentTime: %lu prevTime: %lu deltaTime: %lu 	dt: %0.9lf     ", currentTime, printf_prevTime, deltaTime, dt);
-//
-
-	queue_status = osMessageQueuePut(CtrlTsk_QueueHandle, &CtrlTsk_data, 0, 0);
-
-	if (queue_status != osOK) {
-	    printf("❌ Failed to enqueue message! Error code: %d\r\n", queue_status);
-	}
+    /* ------------------------------------------------------------------
+     *  9. Publish — telemetry snapshot for UART_TX_Task
+     * ------------------------------------------------------------------ */
+    CtrlTsk_data.robot_state = (uint8_t)state;
+    osMessageQueuePut(CtrlTsk_QueueHandle, &CtrlTsk_data, 0, 0);
   }
   /* USER CODE END StartControlTask */
+}
+
+/* -------------------------------------------------------------------------
+ * BNO085 IMU Task — SH2 callbacks and service loop
+ *
+ * Ported verbatim from STM32H7_OMNIBASE_CAN_BNO085/CM7/Core/Src/main.c:1485-1630
+ * with the printf preface removed (PEDRO_OMNIBASE has no UART TX mutex).
+ * ---------------------------------------------------------------------- */
+
+static void imu_async_event_cb(void *cookie, sh2_AsyncEvent_t *event)
+{
+    (void)cookie;
+    if (event->eventId == SH2_RESET) {
+        g_bno085_sensor_ready = 1;
+    }
+}
+
+static void imu_sensor_data_cb(void *cookie, sh2_SensorEvent_t *event)
+{
+    (void)cookie;
+    sh2_SensorValue_t val;
+    if (sh2_decodeSensorEvent(&val, event) != SH2_OK) return;
+
+    switch (val.sensorId) {
+    case SH2_ROTATION_VECTOR: {
+        g_bno085_qx = val.un.rotationVector.i;
+        g_bno085_qy = val.un.rotationVector.j;
+        g_bno085_qz = val.un.rotationVector.k;
+        g_bno085_qw = val.un.rotationVector.real;
+
+        float yaw, pitch, roll;
+        q_to_ypr(val.un.rotationVector.real,
+                 val.un.rotationVector.i,
+                 val.un.rotationVector.j,
+                 val.un.rotationVector.k,
+                 &yaw, &pitch, &roll);
+        g_bno085_yaw   = yaw;
+        g_bno085_pitch = pitch;
+        g_bno085_roll  = roll;
+        break;
+    }
+    case SH2_GYROSCOPE_CALIBRATED:
+        g_bno085_wx = val.un.gyroscope.x;
+        g_bno085_wy = val.un.gyroscope.y;
+        g_bno085_wz = val.un.gyroscope.z;
+        break;
+    case SH2_LINEAR_ACCELERATION:
+        g_bno085_ax = val.un.linearAcceleration.x;
+        g_bno085_ay = val.un.linearAcceleration.y;
+        g_bno085_az = val.un.linearAcceleration.z;
+        break;
+    default:
+        break;
+    }
+}
+
+static void imu_service_ms(uint32_t ms)
+{
+    uint32_t t0 = osKernelGetTickCount();
+    while ((osKernelGetTickCount() - t0) < ms) {
+        sh2_service();
+        osDelay(1);
+    }
+}
+
+static void imu_enable_report(sh2_SensorId_t sensor_id, const char *name)
+{
+    sh2_SensorConfig_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.reportInterval_us = BNO085_REPORT_INTERVAL_US;
+    int rc = sh2_setSensorConfig(sensor_id, &cfg);
+    if (rc != SH2_OK) {
+        printf("BNO085: setSensorConfig(%s) failed rc=%d\r\n", name, rc);
+    }
+}
+
+static void imu_enable_all_reports(void)
+{
+    imu_enable_report(SH2_ROTATION_VECTOR,      "ROTATION_VECTOR");
+    imu_enable_report(SH2_GYROSCOPE_CALIBRATED, "GYROSCOPE_CALIBRATED");
+    imu_enable_report(SH2_LINEAR_ACCELERATION,  "LINEAR_ACCELERATION");
+}
+
+void StartIMUTask(void *argument)
+{
+    (void)argument;
+
+    /* Let the higher-priority tasks finish their startup prints before we
+     * start emitting our own (no UART TX mutex). */
+    osDelay(500);
+    printf("IMU_Task: starting BNO085 init\r\n");
+
+    int rc = sh2_open(BNO085_GetHal(), imu_async_event_cb, NULL);
+    if (rc != SH2_OK) {
+        printf("IMU_Task: sh2_open failed rc=%d — halting\r\n", rc);
+        for (;;) osDelay(1000);
+    }
+
+    imu_service_ms(200);
+
+    rc = sh2_setSensorCallback(imu_sensor_data_cb, NULL);
+    if (rc != SH2_OK) {
+        printf("IMU_Task: setSensorCallback failed rc=%d\r\n", rc);
+    }
+
+    imu_service_ms(100);
+    imu_enable_all_reports();
+    g_bno085_sensor_ready = 0;
+    g_bno085_running = 1;
+    printf("IMU_Task: BNO085 running at 50 Hz\r\n");
+
+    for (;;) {
+        sh2_service();
+        if (g_bno085_sensor_ready) {
+            g_bno085_sensor_ready = 0;
+            printf("IMU_Task: BNO085 reset detected — re-configuring\r\n");
+            imu_service_ms(200);
+            imu_enable_all_reports();
+        }
+        osDelay(2);
+    }
 }
 
 /**

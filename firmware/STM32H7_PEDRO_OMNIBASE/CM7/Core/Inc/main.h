@@ -96,10 +96,37 @@ typedef struct
 } InputData;
 
 typedef struct {
-    double yaw;
-    double roll;
-    double pitch;
+    double yaw;     // radians, from BNO085 rotation vector
+    double roll;    // radians
+    double pitch;   // radians
+    float qx;       // quaternion x (ROS convention)
+    float qy;
+    float qz;
+    float qw;
+    float wx;       // body-frame angular velocity, rad/s
+    float wy;
+    float wz;
+    float ax;       // body-frame linear acceleration (gravity removed), m/s^2
+    float ay;
+    float az;
 } IMUData;
+
+/**
+ * @brief Robot state machine states.
+ *
+ * IDLE     — booted, motors held at zero PWM, accepting commands. Default after reset.
+ * RUNNING  — actively driving motors from command setpoints.
+ * STOP     — explicit stop requested or watchdog tripped; motors at zero, brake direction.
+ *            Recoverable by sending a fresh command with non-zero setpoint or by sending
+ *            a "go" command (any non-zero wheel speed).
+ * ESTOP    — emergency stop; motors at zero and braked. Requires reset to clear.
+ */
+typedef enum {
+    ROBOT_STATE_IDLE  = 0,
+    ROBOT_STATE_RUNNING = 1,
+    ROBOT_STATE_STOP  = 2,
+    ROBOT_STATE_ESTOP = 3
+} RobotState;
 
 typedef struct {
     double err_x;
@@ -147,6 +174,7 @@ typedef struct {
     TimeState time;
     OdomData odom;
     CtrlOutData ctrl;
+    uint8_t robot_state;   // RobotState value (IDLE/RUNNING/STOP/ESTOP)
 } CtrlTsk_Data;
 /* USER CODE END EFP */
 
@@ -157,8 +185,43 @@ typedef struct {
 #define STLINK_RX_GPIO_Port GPIOD
 #define STLINK_TX_Pin GPIO_PIN_9
 #define STLINK_TX_GPIO_Port GPIOD
+
+/* MCP2515 CS — kept for the original PEDRO MCP2515 build path, but the merged
+ * PEDRO_OMNIBASE target does not initialise SPI1/MCP2515, so this pin is reused
+ * by the BNO085 INT line below. The define is preserved here for source-level
+ * compatibility with the original PEDRO firmware files. */
 #define MCP2515_CS_Pin GPIO_PIN_14
 #define MCP2515_CS_GPIO_Port GPIOD
+
+/* BNO085 IMU wiring — pins re-used from OMNIBASE_CAN_BNO085. PB6/PB7 is I2C1
+ * already configured by CubeMX. PD14/PD15/PA4 are added in MX_GPIO_Init via
+ * USER CODE blocks (these are NOT in the CubeMX-generated table because the
+ * BNO085 was retro-fitted on the PEDRO_OMNIBASE merge — see status.md TODOs). */
+#define BNO085_RST_Pin       GPIO_PIN_15
+#define BNO085_RST_GPIO_Port GPIOD
+#define BNO085_INT_Pin       GPIO_PIN_14
+#define BNO085_INT_GPIO_Port GPIOD
+#define BNO085_WAKE_Pin      GPIO_PIN_4
+#define BNO085_WAKE_GPIO_Port GPIOA
+
+/* Debug-only routing: when DEBUG_LEDS is non-zero, PWM duty cycles and
+ * direction bits are mirrored onto Nucleo on-board LEDs (LD1=PB0, LD2=PE1,
+ * LD3=PB14) instead of the H-bridge pins. Useful for desk-testing without
+ * connected motors / power supply. Define =0 in production builds. */
+#ifndef DEBUG_LEDS
+#define DEBUG_LEDS 0
+#endif
+
+#define LD1_Pin       GPIO_PIN_0
+#define LD1_GPIO_Port GPIOB
+#define LD2_Pin       GPIO_PIN_1
+#define LD2_GPIO_Port GPIOE
+#define LD3_Pin       GPIO_PIN_14
+#define LD3_GPIO_Port GPIOB  /* NOTE: shared with M1 PWM (TIM12_CH1) — only active when DEBUG_LEDS=1 */
+
+/* Robot-level watchdogs / kinematic constants */
+#define CMD_WATCHDOG_TIMEOUT_MS 500u   /* if no command in this window → STOP */
+#define ESTOP_CMD_KEY  (-9999.0)        /* sentinel value the host sends in x_desired to trigger ESTOP */
 
 /* USER CODE END Private defines */
 
