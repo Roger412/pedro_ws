@@ -1237,3 +1237,226 @@ Result:
 Finished <<< serial_comm [1min 1s]
 Summary: 1 package finished [1min 1s]
 ```
+
+---
+
+## 20. Validation pass (session 5)
+
+Date: 2026-05-14.
+
+Scope requested by `session5_validation.md`: firmware source review,
+firmware/ROS protocol cross-check, available builds, ROS package build
+and lint, LED test-mode review, and final TODO prioritisation.
+
+### 20.1 Firmware source review
+
+Reviewed target files under `CM7/Core/Inc` and `CM7/Core/Src`.
+
+- SH2/BNO085 includes are present in the target tree:
+  `Core/Inc/sh2/*.h`, `Core/Src/sh2/*.c`, and `sh2_hal_impl.{h,c}`.
+  `main.c` includes those headers and `.cproject` has the
+  `../Core/Inc/sh2` include path.
+- `MX_I2C1_Init()` is called; `MX_SPI1_Init()` remains disabled as
+  documented because PD14 is reused for BNO085 INT.
+- The BNO085 task is created from `main()` and `StartIMUTask` is
+  forward-declared.
+- The old BNO055 and MCP2515 files are still present but are not in the
+  active control path.
+- No obvious missing C symbols were found by manual review, but the
+  firmware was not compiled because the generated Debug makefiles are
+  stale (see §20.5).
+
+### 20.2 Mecanum mapping validation
+
+Firmware `main.c` matches the documented OMNIBASE mapping:
+
+- `g_wheel_sign[4] = {-1.0, 1.0, -1.0, 1.0}`.
+- `computeNecessaryWheelSpeedsMecanum()` uses the documented OMNIBASE
+  IK signs:
+  - +x body -> `(+,+,+,+)` before `wheel_sign`
+  - +y body -> `(-,+,+,-)` before `wheel_sign`
+  - +yaw -> `(-,+,-,+)` before `wheel_sign`
+- `StartControlTask` applies `g_wheel_sign[i]` on the commanded side
+  for wheel PID, and applies it again to measured encoder speed before
+  forward kinematics.
+- Motor output routing matches the PEDRO H-bridge table:
+  `M0 -> TIM5/PD4/PD5`, `M1 -> TIM12/PD6/PD7`,
+  `M2 -> TIM14/PE2/PE4`, `M3 -> TIM15/PE3/PE6`.
+
+Remaining risk is hardware-dependent: the physical FL/FR/RL/RR identity
+of indices 0..3 still must be verified on the robot.
+
+### 20.3 UART command / telemetry cross-check
+
+Command path is consistent:
+
+- `serial_communication.py` sends exactly 30 space-separated values:
+  5 pose/geometry fields, 4 wheel setpoints, and 21 PID gains.
+- `start_UART_RX_Task` parses the same 30 fields with `sscanf`.
+- Host defaults match firmware semantics for twist mode:
+  `d = 0.195`, `r = 0.0762`, and all `u*_desired = 0.0`, so `/cmd_vel`
+  maps into `x_desired/y_desired/phi_end` and lets firmware IK compute
+  the wheels.
+- ESTOP sentinel is consistent: host helper uses `x_desired = -9999.0`;
+  firmware compares against `ESTOP_CMD_KEY`.
+
+Telemetry path is consistent:
+
+- Firmware emits comma-separated `key=value` pairs.
+- ROS parser uses a dict regex that accepts integers, decimals, signs,
+  and scientific notation.
+- All firmware keys consumed by ROS are present in the `printf` format:
+  encoder counters, wheel omegas, odom, PID gains, PWM duty,
+  `IMU_q*`, `IMU_w*`, `IMU_a*`, and `robot_state`.
+- Dashboard subscriptions match topics published by
+  `serial_communication.py`: `stm32/raw`, `stm32/cmd_setpoint`,
+  `imu/data`, `stm32/encoders`, `stm32/omegas`, `odom`, `stm32/pwm`,
+  `stm32/ctrl_u`, `stm32/errors`, `stm32/u_errors`,
+  `stm32/robot_state`, `stm32/robot_state_name`, and `stm32_debug`.
+
+No command/telemetry mismatch was found.
+
+### 20.4 LED test mode validation
+
+`DEBUG_LEDS` is present as a standalone compile-time desk-test mode:
+
+- `main.h` defaults `DEBUG_LEDS` to 0.
+- `MX_GPIO_Init()` conditionally configures Nucleo LEDs when
+  `DEBUG_LEDS != 0`.
+- `StartControlTask` holds all H-bridge direction pins in brake and
+  zeros all real PWM compare registers in the `#if DEBUG_LEDS` branch.
+- LD1 mirrors M0/M2 activity and LD2 mirrors M1/M3 activity.
+- LD3 is intentionally skipped because PB14 is shared with TIM12_CH1
+  for M1 PWM.
+
+This is functionally standalone for desk testing command flow without
+motor motion, subject to a firmware build after the generated makefiles
+are repaired.
+
+### 20.5 Build and lint results
+
+Firmware build attempt:
+
+```
+cd firmware/STM32H7_PEDRO_OMNIBASE/CM7/Debug
+make -j4
+```
+
+Result: **failed before compilation**. The generated Debug makefiles
+still reference absolute source and linker paths under
+`/home/roger/Github/home-custom-base/firmware/STM32H7_OMNIBASE/...`.
+The first hard failure was:
+
+```
+No rule to make target '/home/roger/Github/home-custom-base/firmware/STM32H7_OMNIBASE/Middlewares/Third_Party/FreeRTOS/Source/CMSIS_RTOS_V2/cmsis_os2.c'
+```
+
+`arm-none-eabi-gcc` is not on the default PATH, but CubeIDE 1.18.1 is
+installed and includes GNU Arm toolchain 13.3.rel1 under
+`/opt/st/stm32cubeide_1.18.1/.../tools/bin`. The build-system paths must
+be regenerated or fixed before C compile/link errors can be validated.
+
+ROS build:
+
+```
+cd /home/roger/Github/pedro_ws/omnibase_ws
+colcon build --packages-select serial_comm --symlink-install
+```
+
+Result: **passed**.
+
+```
+Finished <<< serial_comm [1min 31s]
+Summary: 1 package finished [1min 31s]
+```
+
+Python syntax:
+
+```
+python3 -m py_compile serial_communication.py pedro_dashboard.py
+```
+
+Result: **passed**.
+
+ROS package tests/lint:
+
+```
+python3 -m pytest test
+```
+
+Result: **failed**. `test_copyright.py` was skipped, but
+`test_flake8.py` and `test_pep257.py` failed. The failures are style
+only:
+
+- `serial_communication.py`: alignment spacing (`E221`/`E222`),
+  inline-comment spacing (`E261`), two line-length violations at the
+  package's 99-column flake8 threshold, and one raw-docstring warning
+  (`D301`).
+- `simple_rx.py`: missing blank lines around class/function definitions.
+
+The direct `python3 -m flake8 serial_comm test` command also reports
+many stricter 79-column `E501` warnings because it does not use the
+package test configuration. The package test configuration is the
+authoritative one for `colcon test`.
+
+### 20.6 Remaining errors / mismatches
+
+Software issues:
+
+1. **Firmware generated build files are stale.** `CM7/Debug/*.mk` and
+   the linker-script reference still point to the old
+   `home-custom-base/firmware/STM32H7_OMNIBASE` tree. This blocks real
+   firmware compile validation.
+2. **ROS lint tests fail.** The ROS package builds and syntax-compiles,
+   but `colcon test` will remain red until the style/docstring issues
+   above are cleaned up.
+3. **`simple_rx.py` has pre-existing flake8 spacing failures.** It was
+   not part of the protocol update, but it is part of the package lint
+   test and must be cleaned or excluded.
+
+No STM32/ROS command-format mismatch, telemetry-format mismatch, or
+dashboard topic mismatch was found.
+
+### 20.7 Final TODO list by priority
+
+P0 software, before firmware can be trusted:
+
+1. Regenerate or repair the STM32CubeIDE CM7 Debug/Release build files
+   so all source, middleware, and linker-script paths point inside
+   `firmware/STM32H7_PEDRO_OMNIBASE` or other intentionally vendored
+   local paths.
+2. Re-run the firmware build with the CubeIDE-bundled GNU Arm toolchain
+   on PATH and fix any real compile/link errors that appear after the
+   stale path failure is removed.
+
+P1 software, before CI/release:
+
+3. Fix ROS flake8/pep257 failures in `serial_communication.py` and
+   `simple_rx.py`; then run `python3 -m pytest test` or `colcon test
+   --packages-select serial_comm`.
+4. Optionally add a ROS service or topic for ESTOP instead of leaving
+   `send_estop()` as an internal helper.
+5. Optionally emit firmware body-frame velocities
+   (`Body_x_vel_calc`, `Body_y_vel_calc`) so ROS odometry does not need
+   to rotate world-frame velocity back into `base_link`.
+
+P0 hardware-dependent, before powered drive:
+
+6. Confirm wheel index to physical wheel location (FL/FR/RL/RR) and
+   verify that the preserved OMNIBASE `wheel_sign` pattern drives +x,
+   +y, and +yaw correctly on PEDRO.
+7. Confirm the BNO085 wiring for PD14 INT, PD15 RST, and PA4 WAKE on
+   the actual PEDRO hardware, and update the `.ioc` / GPIO init if the
+   wiring differs.
+8. Measure PEDRO `x_off`, `y_off`, wheel radius, and encoder counts per
+   wheel revolution; update the hardcoded `0.195`, `0.0762`, and
+   `R_counts = 424.0` constants if they do not match.
+9. Bench-test `DEBUG_LEDS=1` before motor power, then test with motors
+   lifted before ground driving.
+
+P1 hardware/safety:
+
+10. Decide whether to enable hardware IWDG/WWDG so a firmware hang
+    cannot leave the last PWM duty applied.
+11. Decide whether ESTOP should remain reset-only or gain a deliberate
+    clear command.
