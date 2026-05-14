@@ -1,0 +1,261 @@
+I need you to help me migrate and adapt firmware and ROS 2 functionality for a new STM32H7 mecanum base project.
+
+Context:
+
+There are three relevant projects:
+
+1. Base PEDRO STM32 project:
+   /home/roger/Github/pedro_ws/firmware/STM32H7_PEDRO
+
+   The important firmware code is currently inside the Inc and Src folders of the CM7 folder.
+
+2. Previous omnibase STM32 project:
+   /home/roger/Github/home-custom-base/firmware/STM32H7_OMNIBASE_CAN_BNO085/CM7
+
+   This project was derived from the PEDRO-style base, but instead of H-bridges it uses 4 ODrive motor controllers over CAN. It also includes functionality such as a BNO085 IMU, state machine logic, UART communication, telemetry formatting, mecanum wheel mapping, and other useful architecture.
+
+3. Target project to modify:
+   /home/roger/Github/pedro_ws/firmware/STM32H7_PEDRO_OMNIBASE
+
+   This is a copy of the PEDRO project. Make firmware modifications here, not in the original STM32H7_PEDRO project.
+
+The goal is to create a mecanum-wheeled robot base using:
+- STM32H7 firmware
+- BNO085 IMU over I2C
+- 4 DC motors with encoders
+- 2 L298N H-bridge drivers
+- ROS 2 communication through UART
+- Possible future expansion such as Bluetooth or additional sensors
+
+The L298N H-bridge control uses:
+- Two digital direction signals per motor
+- One PWM signal per motor
+
+This should already be visible in the main.c of the base PEDRO project. Use the existing base project pinout and behavior where possible. Do not invent new pin assignments unless absolutely necessary.
+
+Before connecting real motors, I want to test the STM32 H-bridge output signals using LEDs on a protoboard. The LEDs should show the same signals that would go to the L298N:
+- Direction signal 1
+- Direction signal 2
+- PWM signal
+
+The idea is that if the STM32 produces the correct direction and PWM signals on LEDs, then the L298N H-bridges should work correctly once connected.
+
+ROS 2 workspace:
+/home/roger/Github/pedro_ws/omnibase_ws
+
+Relevant ROS 2 package:
+/home/roger/Github/pedro_ws/omnibase_ws/src/serial_comm
+
+Reference ROS 2 serial command and parsing nodes are inside that package. The expected ROS 2 command format is through UART and should be determined from the referenced serial_comm nodes.
+
+Reference dashboard package and node:
+/home/roger/Github/home-custom-base/omnibase_ws/src/odrive_comm
+/home/roger/Github/home-custom-base/omnibase_ws/src/odrive_comm/odrive_comm/odrive_dashboard.py
+
+Important recovered analysis file:
+conversation.txt
+
+Important mecanum mapping requirement:
+
+The mecanum wheel mapping, including wheel order, motor index order, sign conventions, and kinematic direction conventions, must be taken from the main.c file in:
+
+/home/roger/Github/home-custom-base/firmware/STM32H7_OMNIBASE_CAN_BNO085/CM7
+
+Do not invent a new wheel order or sign convention. Reuse the same mecanum mapping used in the OMNIBASE_CAN_BNO085 CM7 main.c, then adapt only the motor output layer from ODrive CAN velocity commands to PWM + L298N H-bridge control.
+
+Document the final wheel mapping clearly in status.md, including:
+- Motor index
+- Physical wheel position
+- Sign convention
+- Encoder sign, if applicable
+- PWM/H-bridge output mapping
+
+Tasks:
+
+1. Analyze the current PEDRO STM32 project
+
+Inspect:
+/home/roger/Github/pedro_ws/firmware/STM32H7_PEDRO
+
+Focus on the CM7 Inc and Src folders, especially main.c.
+
+Also read conversation.txt, which contains information from a recovered conversation analyzing a similar base project.
+
+Use both sources to determine:
+- Current status of the PEDRO firmware
+- Current pinout
+- Current implemented functionality
+- Existing UART/serial communication format
+- Existing L298N H-bridge motor control functionality
+- Existing PWM and digital direction signal behavior
+- Existing encoder functionality
+- Existing IMU functionality, if any
+- Existing FreeRTOS/task structure, if any
+- What is missing to control the H-bridge outputs from ROS 2
+
+The encoder usage should be determined from the main.c of the base PEDRO project.
+
+Explain what is needed to connect LEDs on a protoboard to test the L298N control signals before connecting real motors.
+
+The ROS 2 side should control this through the serial_comm package in:
+/home/roger/Github/pedro_ws/omnibase_ws/src/serial_comm
+
+2. Analyze the OMNIBASE_CAN_BNO085 STM32 project
+
+Inspect:
+/home/roger/Github/home-custom-base/firmware/STM32H7_OMNIBASE_CAN_BNO085/CM7
+
+In particular, inspect its main.c and any relevant files in Inc and Src.
+
+Identify which parts can be reused or adapted for the PEDRO H-bridge-based robot.
+
+Evaluate these features:
+- State machine
+- BNO085 IMU integration
+- UART telemetry format
+- UART command parsing
+- Bluetooth through serial connection, if present
+- Watchdog / timeout / emergency stop behavior
+- Mecanum kinematics
+- Mecanum wheel order, motor index order, sign conventions, and direction conventions
+- Odometry
+- Telemetry publishing
+- Dashboard-related data
+- Any reusable architecture from FreeRTOS tasks, queues, or message structs
+
+Important BNO085 requirement:
+The BNO085 interface is I2C, as shown in the OMNIBASE_CAN_BNO085 project. Its exact functionality and task structure should be copied/adapted because it already works well and is independent from the ODrive-specific parts.
+
+Important mecanum mapping requirement:
+The mecanum wheel mapping, including signs and order, should be copied from the OMNIBASE_CAN_BNO085 CM7 main.c. The target project should preserve that mapping and only replace the ODrive CAN motor command layer with the equivalent PWM + L298N H-bridge output layer.
+
+Important ODrive distinction:
+The OMNIBASE_CAN_BNO085 project uses odrive.c extensively because it controls ODrives over CAN. Since the target PEDRO robot uses PWM motors and L298N H-bridges instead, do not blindly copy ODrive-specific logic. Evaluate what should be removed, replaced, or adapted.
+
+For example:
+- ODrive startup/configure logic does not apply.
+- ODrive CAN telemetry does not apply.
+- A STOP state still applies, but should stop the PWM/H-bridge motor outputs.
+- A state machine still applies, but the states should make sense for PWM + L298N H-bridge motor control.
+- A dashboard still applies, but it should visualize the equivalent available data for the PEDRO H-bridge robot instead of ODrive-specific CAN data.
+
+3. Modify the target STM32 project
+
+Apply applicable firmware changes only to:
+/home/roger/Github/pedro_ws/firmware/STM32H7_PEDRO_OMNIBASE
+
+Do not modify the original PEDRO project unless absolutely necessary.
+
+After comparing the base PEDRO project with OMNIBASE_CAN_BNO085, fully implement in STM32H7_PEDRO_OMNIBASE everything that is evaluated to be applicable to this H-bridge-based mecanum robot.
+
+Add to the CM7 main.c everything that is applicable from the OMNIBASE_CAN_BNO085 project.
+
+Also copy/adapt any necessary Inc and Src files from OMNIBASE_CAN_BNO085 into STM32H7_PEDRO_OMNIBASE when they are useful for this H-bridge-based project.
+
+The adapted firmware should support:
+- UART command reception from ROS 2
+- Motor commands for 4 mecanum wheels, using the same wheel order, motor index order, sign conventions, and mecanum kinematic mapping found in the OMNIBASE_CAN_BNO085 CM7 main.c
+- PWM + digital direction control for 2 L298N H-bridges controlling 4 motors
+- Encoder reading, using the encoder logic already present in the base PEDRO project
+- BNO085 IMU readings over I2C, using the working task/functionality from OMNIBASE_CAN_BNO085
+- Odometry calculation, if enough information is already available
+- Telemetry transmission back to ROS 2
+- STOP / timeout safety behavior
+- A state machine appropriate for PWM + L298N H-bridge motor control
+- A debug/test mode suitable for LED testing on a protoboard before connecting motors
+
+Do not invent unsafe hardware details. Instead:
+- Reuse existing CubeMX-generated definitions where available.
+- Reuse pin definitions already present in main.h and main.c.
+- Reuse existing timer/PWM/encoder configuration where available.
+- Mark only genuinely missing hardware-specific items as TODO.
+- Keep the code structured so missing pin mappings or constants can be filled in later.
+
+4. Update the ROS 2 serial_comm package
+
+Inspect:
+/home/roger/Github/pedro_ws/omnibase_ws/src/serial_comm
+
+The expected ROS 2 command format is through UART and should be determined from the existing ROS 2 nodes in this package.
+
+Ensure serial_communication.py can receive and parse the telemetry format sent by the STM32.
+
+It should publish the corresponding ROS 2 topics for the available data, such as:
+- Commanded velocities
+- IMU data
+- Encoder data
+- Odometry data
+- Motor/PWM data
+- State machine status
+- Error/status flags
+
+If the STM32 telemetry format needs to change, update both the firmware and serial_communication.py consistently.
+
+5. Create a dashboard node
+
+In the serial_comm package, create a dashboard node based on the existing dashboard approach in:
+/home/roger/Github/home-custom-base/omnibase_ws/src/odrive_comm
+/home/roger/Github/home-custom-base/omnibase_ws/src/odrive_comm/odrive_comm/odrive_dashboard.py
+
+Do not just copy the ODrive dashboard blindly. First inspect the odrive_comm package and odrive_dashboard.py to understand:
+- What the dashboard does
+- What topics it subscribes to
+- What data it visualizes
+- How it calculates connection status
+- How it displays telemetry
+- How it handles missing or stale data
+- How it organizes the UI
+
+Then create an equivalent dashboard for the PEDRO H-bridge robot using the data that applies to this project.
+
+Remove or replace fields that only apply to ODrive/CAN.
+
+For example:
+- ODrive axis state/configuration/startup fields should be removed or replaced.
+- Motor state should instead reflect PWM/H-bridge/encoder status.
+- STOP should be interpreted as stopping the motors through the H-bridge outputs.
+- Connection status should reflect STM32 UART telemetry freshness.
+
+6. Documentation requirement
+
+Create or update this file in the target project:
+
+status.md
+
+Write the following into status.md:
+- Analysis of the original PEDRO project
+- Analysis of conversation.txt
+- Current inferred pinout/status of the PEDRO project
+- Current L298N H-bridge signal mapping
+- Final mecanum wheel mapping copied from OMNIBASE_CAN_BNO085 CM7 main.c
+- Motor index order
+- Physical wheel position per motor index
+- Sign convention per motor
+- Encoder sign convention, if applicable
+- PWM/H-bridge output mapping
+- Functionality currently present
+- Functionality missing
+- What was compared against OMNIBASE_CAN_BNO085
+- What features were selected for merging
+- What features were rejected because they only apply to ODrive/CAN
+- What firmware files were modified or added
+- What ROS 2 files were modified or added
+- How the STM32 telemetry format works
+- How the ROS 2 UART command format works
+- How to test the H-bridge outputs first with LEDs on a protoboard
+- How to test ROS 2 serial communication
+- Remaining TODOs and hardware assumptions
+- A summary of the reasoning and changes made
+
+Also write a concise summary of the reasoning and changes to:
+
+status.txt
+
+7. Validation
+
+After making changes:
+- Try to build the STM32 project if possible, or at least check for obvious compile errors.
+- Try to build the ROS 2 workspace/package if possible.
+- Do not leave broken imports or missing file references.
+- Do not remove existing useful functionality unless it conflicts with the new target design.
+- Keep the implementation modular so future features can be added.

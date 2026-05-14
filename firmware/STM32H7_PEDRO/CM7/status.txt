@@ -1,0 +1,299 @@
+================================================================================
+  STM32H7 OMNIBASE - PROJECT STATUS
+  Last updated: 2026-05-06
+================================================================================
+
+
+--------------------------------------------------------------------------------
+  PINOUT (verified against stm32h7xx_hal_msp.c and main.c)
+--------------------------------------------------------------------------------
+
+  BNO055 IMU (I2C1)
+  ------------------
+  PB6    BNO055 I2C_SCL
+  PB7    BNO055 I2C_SDA
+
+  NOTE: I2C is open-drain. If using a bare BNO055 IC (not a breakout board),
+  add 10kOhm pull-up resistors from PB6 and PB7 to 3.3V.
+  Breakout boards (Adafruit, etc.) usually include them already.
+  The STM32 has internal ~40kOhm pull-ups but they may be too weak for
+  reliable communication over longer wires.
+
+  H-Bridge 1 Direction (GPIOD) - Motors 1 & 2
+  ----------------------------------------------
+  PD4    H-Bridge 1 IN1  (Motor 1 dir)
+  PD5    H-Bridge 1 IN2  (Motor 1 dir)
+  PD6    H-Bridge 1 IN3  (Motor 2 dir)
+  PD7    H-Bridge 1 IN4  (Motor 2 dir)
+
+  H-Bridge 2 Direction (GPIOE) - Motors 3 & 4
+  ----------------------------------------------
+  PE2    H-Bridge 2 IN1  (Motor 3 dir)
+  PE4    H-Bridge 2 IN2  (Motor 3 dir)
+  PE3    H-Bridge 2 IN3  (Motor 4 dir)
+  PE6    H-Bridge 2 IN4  (Motor 4 dir)
+
+  PWM (H-Bridge Enable pins)
+  ---------------------------
+  PA0    H-Bridge 1 ENA  (Motor 1) -- TIM5  CH1
+  PE5    H-Bridge 1 ENB  (Motor 2) -- TIM12 CH1
+  PB14   H-Bridge 2 ENA  (Motor 3) -- TIM14 CH1
+  PF9    H-Bridge 2 ENB  (Motor 4) -- TIM15 CH1
+
+  PWM frequency: ~1 kHz (Prescaler=239, Period=19999, assuming 240 MHz APB clock)
+  Duty cycle range: 0 - 19999
+
+  Encoders (all in TI12 encoder mode, 16-bit counters, period=65535)
+  -------------------------------------------------------------------
+  PE9    Encoder 1 Signal A -- TIM1 CH1
+  PE11   Encoder 1 Signal B -- TIM1 CH2
+  PA15   Encoder 2 Signal A -- TIM2 CH1   <-- NOTE: pinout doc says PA5, WRONG.
+  PB3    Encoder 2 Signal B -- TIM2 CH2        PA5 is SPI1_SCK (MCP2515 CAN).
+  PD12   Encoder 3 Signal A -- TIM4 CH1        Physical wire must go to PA15.
+  PD13   Encoder 3 Signal B -- TIM4 CH2
+  PC6    Encoder 4 Signal A -- TIM8 CH1
+  PC7    Encoder 4 Signal B -- TIM8 CH2
+
+  Encoder resolution: 424 counts/revolution (hardcoded in ControlTask)
+  Encoder velocity unit: rev/s  (rad/count / dt / 2pi)
+
+  USART3 - Serial communication with ROS2
+  ----------------------------------------
+  Connected to micro-USB port (virtual COM port)
+  Baud: 115200, 8N1, no flow control
+
+
+--------------------------------------------------------------------------------
+  FREERTOS TASKS
+--------------------------------------------------------------------------------
+
+  1. start_UART_RX_Task
+     Priority : High
+     Stack    : 3072 bytes
+     Role     : Receives serial bytes from USART3 via ISR ring buffer (uart_rx.h).
+                Assembles incoming bytes into lines (newline or carriage return
+                terminated). Parses each complete line as exactly 30
+                space-separated floats using sscanf. On success, pushes the
+                parsed InputData and PIDConfig structs into two message queues
+                (UART2CtrlTsk_QueueHandle and UART2KPIDs_QueueHandle) consumed
+                by ControlTask, and into two additional queues used by the TX
+                task for echo-back in telemetry.
+
+  2. StartControlTask
+     Priority : AboveNormal
+     Stack    : 5120 bytes
+     Role     : Main 10 ms control loop. Steps each iteration:
+                  1. Read raw encoder counts from TIM1/TIM2/TIM4/TIM8 CNT regs.
+                  2. Compute signed delta counts (handles 16-bit wrap-around).
+                  3. Convert deltas to wheel angular velocities (rev/s).
+                  4. Block on queues to receive desired setpoints and PID gains
+                     from the UART RX task.
+                  5. Compute pose errors (err_x, err_y, err_phi).
+                  6. If velocity_ctrl_mode=false: run three pose PIDs to produce
+                     x_dot, y_dot, phi_dot, then run IK to get wheel setpoints.
+                     If velocity_ctrl_mode=true (current default): use u1-u4
+                     from UART directly as wheel angular velocity setpoints.
+                  7. Run four independent per-wheel PID controllers to convert
+                     velocity errors into PWM duty cycle values.
+                  8. Set H-bridge direction GPIO pins and PWM compare registers.
+                  9. Run forward kinematics (omni) on measured wheel speeds to
+                     estimate global body velocities, then integrate for odometry.
+                 10. Push telemetry struct to CtrlTsk_QueueHandle for TX task.
+
+  3. Start_UART_TX_Task
+     Priority : Normal
+     Stack    : 2048 bytes
+     Role     : Reads telemetry from CtrlTsk_QueueHandle and PID gains from
+                kpids_UART_TX_QueueHandle, then prints a single comma-separated
+                key=value line (~60 fields) over USART3 at approximately 100 Hz.
+                The ROS2 node parses this line with regex to populate all
+                published topics.
+
+  4. StartDefaultTask
+     Priority : Normal
+     Stack    : 512 bytes
+     Role     : Empty / commented out. Not meant to execute. Reserved by
+                CubeMX code generation; do not delete (FreeRTOS requirement).
+
+
+--------------------------------------------------------------------------------
+  SERIAL PROTOCOL  (USART3, 115200 8N1)
+--------------------------------------------------------------------------------
+
+  TX (STM32 -> PC), ~100 Hz, one line per cycle:
+    key=value,key=value,...\r\n
+    Fields: x_desired, y_desired, phi_desired, d, r,
+            roll, pitch, yaw,
+            TIM1, TIM2, TIM4, TIM8,
+            Enc_Wheel_Omega1..4,
+            Inertial_ang_vel_calc, Inertial_x_vel_calc, Inertial_y_vel_calc,
+            ODOM_phi, ODOM_x_pos, ODOM_y_pos,
+            ODOM_Err_x, ODOM_Err_y, ODOM_Err_phi,
+            U_Err_1..4,
+            Ctrl_Inertial_x_dot, Ctrl_Inertial_y_dot, Ctrl_Inertial_phi_dot,
+            Ctrl_necc_u1..4,
+            ts_current, ts_previous, ts_delta,
+            Ctrl_duty_u1..4,
+            xKp, xKi, xKd, yKp, yKi, yKd, phiKp, phiKi, phiKd,
+            u0Kp..u3Kd
+
+  RX (PC -> STM32), sent by ROS2 node at 10 Hz:
+    30 space-separated floats, terminated with \r\n
+    Position:  [0]  x_desired
+               [1]  y_desired
+               [2]  phi_end
+               [3]  d          (wheel distance from center, meters)
+               [4]  r          (wheel radius, meters)
+    Wheel vel: [5]  u1_desired  (rev/s, front-left)
+               [6]  u2_desired  (rev/s, front-right)
+               [7]  u3_desired  (rev/s, rear-left)
+               [8]  u4_desired  (rev/s, rear-right)
+    PID gains: [9..11]  xKp  xKi  xKd
+               [12..14] yKp  yKi  yKd
+               [15..17] phiKp phiKi phiKd
+               [18..20] u0Kp  u0Ki  u0Kd
+               [21..23] u1Kp  u1Ki  u1Kd
+               [24..26] u2Kp  u2Ki  u2Kd
+               [27..29] u3Kp  u3Ki  u3Kd
+
+
+--------------------------------------------------------------------------------
+  ISSUES & CHANGES NEEDED FOR MECANUM CONTROL
+--------------------------------------------------------------------------------
+
+  ISSUE 1 - Wrong pin documented for Encoder 2
+  ----------------------------------------------
+  The pinout document lists PA5 for Encoder 2 Signal A (TIM2 CH1).
+  This is INCORRECT. The firmware configures PA15 (JTDI remap) for TIM2 CH1.
+  PA5 is used by SPI1_SCK (MCP2515 CAN chip) and will not work as encoder input.
+  Action: Verify the physical wire goes to PA15, not PA5.
+
+
+  ISSUE 2 - Odometry uses omni-wheel forward kinematics, not mecanum
+  -------------------------------------------------------------------
+  File: main.c, line ~2005
+  Current code:
+      globalSpeedsFromUOmni(odom->phi, data.d, data.r, enc->omegaVals, odom->q_dot);
+  The omni formula assumes 4 omni wheels oriented at 90 deg intervals.
+  For mecanum wheels the correct formula is globalSpeedsFromUMecanum(), which
+  takes x_off and y_off (half wheel-base values) instead of d.
+
+  Fix:
+      // Define these as constants or add to InputData struct
+      double x_off = 0.15;  // half of wheel-base width  (meters, tune to robot)
+      double y_off = 0.15;  // half of wheel-base length (meters, tune to robot)
+      globalSpeedsFromUMecanum(odom->phi, x_off, y_off, data.r,
+                               enc->omegaVals, odom->q_dot);
+
+  Also change the IK call in pose control mode (line ~1945) to:
+      computeNecessaryWheelSpeedsMecanum(odom->phi, x_off, y_off, data.r,
+                                         ctrl_out->u, ctrl_out->phi_dot,
+                                         ctrl_out->y_dot, ctrl_out->x_dot);
+
+
+  ISSUE 3 - No cmd_vel -> wheel speed decomposition in ROS2 node
+  ---------------------------------------------------------------
+  File: serial_communication.py
+  The ROS2 node currently has no subscriber for geometry_msgs/Twist (cmd_vel).
+  The only way to move the robot is to manually set the u1_desired..u4_desired
+  ROS2 parameters, which is impractical for teleoperation or navigation.
+
+  Fix: Add a cmd_vel subscriber that applies mecanum inverse kinematics and
+  updates message_tx[5:9] before the next serial TX.
+
+  Add to __init__:
+      self.lx = 0.15  # half wheel-base width  (meters, tune to robot)
+      self.ly = 0.15  # half wheel-base length (meters, tune to robot)
+      self.r  = 0.05  # wheel radius            (meters, tune to robot)
+      self.cmd_vel_sub = self.create_subscription(
+          Twist, 'cmd_vel', self.cmd_vel_callback, 10)
+
+  Add import at top:
+      from geometry_msgs.msg import Twist
+
+  Add method:
+      def cmd_vel_callback(self, msg):
+          vx    = msg.linear.x
+          vy    = msg.linear.y
+          omega = msg.angular.z
+          r     = self.r
+          lxy   = self.lx + self.ly
+          # Mecanum IK (standard configuration, body frame)
+          u1 = (vx - vy - lxy * omega) / r  # front-left
+          u2 = (vx + vy + lxy * omega) / r  # front-right
+          u3 = (vx + vy - lxy * omega) / r  # rear-left
+          u4 = (vx - vy + lxy * omega) / r  # rear-right
+          self.message_tx[5] = round(u1, 3)
+          self.message_tx[6] = round(u2, 3)
+          self.message_tx[7] = round(u3, 3)
+          self.message_tx[8] = round(u4, 3)
+
+  NOTE: The firmware PID setpoints and encoder readings are in rev/s, not rad/s.
+  The IK above produces rad/s if r is in meters. Divide by 2*pi to convert,
+  OR consistently use r_eff = r * 2 * pi so units cancel. The simplest fix is
+  to treat the firmware's "omega" unit as rad/s by removing the / (2*pi) divisor
+  in the encoder velocity calculation (see Issue 4).
+
+
+  ISSUE 4 - Encoder velocity unit inconsistency (rev/s vs rad/s)
+  ---------------------------------------------------------------
+  File: main.c, lines ~1851-1854
+  Current code:
+      enc->omegaVals[i] = deltaEncCounts[i] * Rads_per_count / (ts->delta / 1000.0f) / (2*PI);
+  Rads_per_count / (2*pi) = counts-to-revolutions, so omegaVals is in rev/s.
+  This is internally consistent with the PID since u_desired is also sent as
+  rev/s from the ROS2 node, but it is non-standard.
+
+  Optional fix for SI units (rad/s):
+      enc->omegaVals[i] = deltaEncCounts[i] * Rads_per_count / (ts->delta / 1000.0f);
+  Then update the cmd_vel_callback in the ROS2 node: no division by 2*pi needed,
+  IK output is already in rad/s.
+
+
+  ISSUE 5 - Per-wheel PID integral windup limit is unrealistically large
+  -----------------------------------------------------------------------
+  File: main.c, line ~1812
+      double max_integral_action_val = 999999999999999;
+  This is effectively no limit. If a wheel is stalled or disconnected, the
+  integrator will wind up to very large values and cause a sudden large output
+  when the wheel eventually moves.
+  Recommendation: Set this to a value ~10x the maximum expected PWM contribution
+  from the integral term, e.g. 5000 to 20000, and tune from there.
+
+
+  ISSUE 6 - Pose control mode (velocity_ctrl_mode=false) is untested
+  -------------------------------------------------------------------
+  The pose PIDs compute x_dot and y_dot independently (not simultaneously),
+  which means diagonal motion targets do not move diagonally -- x and y are
+  corrected in separate conditions. Also phi is only corrected after x and y
+  errors are within threshold. This is functional for sequential moves but will
+  not produce smooth curved paths.
+  No action needed unless you plan to use pose mode rather than velocity mode.
+
+
+--------------------------------------------------------------------------------
+  RECOMMENDED BRING-UP SEQUENCE
+--------------------------------------------------------------------------------
+
+  1. Verify PA15 is wired as Encoder 2 Signal A (not PA5).
+
+  2. Add 10kOhm pull-ups on PB6 and PB7 to 3.3V if not already present on
+     your BNO055 module.
+
+  3. Flash firmware. Connect via USART3 (micro-USB). Run the ROS2 node and
+     confirm telemetry is received on stm32/raw and stm32/odom topics.
+
+  4. With wheels off the ground, publish a cmd_vel with only vx set. Confirm
+     all four encoder omegas change in the expected directions (FL/RL same sign,
+     FR/RR same sign, left vs right opposite).
+
+  5. Tune per-wheel PID gains (u0..u3 Kp/Ki/Kd) via ROS2 parameter server
+     until each wheel tracks its setpoint without oscillation.
+
+  6. Fix the odometry forward kinematics (Issue 2) and measure x_off, y_off, r
+     physically. Verify odometry drift is reasonable with a known straight path.
+
+  7. Optionally enable BNO055 (set usingIMU = 1 in ControlTask) to correct
+     odometry heading drift with the IMU yaw reading.
+
+================================================================================
